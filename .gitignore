@@ -1,0 +1,7 @@
+# Configuration and Credential Files
+.env
+credentials.json
+token.json
+
+# Directories
+attachments/
