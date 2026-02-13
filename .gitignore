@@ -6,6 +6,9 @@ token.json
 # Directories
 attachments/
 
+#Statements
+*.xlsx
+
 # Ignore Mac OS X system files
 .DS_Store
 
