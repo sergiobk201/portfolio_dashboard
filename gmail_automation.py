@@ -20,6 +20,7 @@ import uuid
 from typing import Set
 from io import StringIO
 from dotenv import load_dotenv
+import yfinance as yf 
 
 load_dotenv()
 pdf_password = os.getenv('PASSWORD_PDF')
@@ -36,7 +37,42 @@ DB_PORT = os.environ.get("port")
 class GmailRicoImporter:
 
     def __init__(self):
-        pass
+        self.df = pd.DataFrame()
+        self.full_text = ""
+        self.today = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.pdf_path = ""
+        self.output_pdf = ""
+        self.dst = ""
+        self.db_trades_df = pd.DataFrame()
+        self.db_assets_df = pd.DataFrame()
+
+    def run_pipeline(self):
+        print("--- Starting pipeline ---")
+        self.gmail_import()
+
+        if not os.path.exists(self.pdf_path):
+            print('No PDF found to process. Exiting...')
+            return
+            
+        self.final_pdf()
+        self.read_pdf()
+        self.extract_fees()
+        self.add_data_to_df()
+        self.get_trades_table()
+        self.get_assets_table()
+
+        self.resolve_trades_df()
+        self.resolve_assets_with_db()
+
+        self.resolve_trades_portfolio()
+        self.validate_trade_ids()
+        self.final_transformation()
+        
+
+        self.load_to_db()
+        print("--- Pipeline Finished Successfully")
+
+
 
     def gmail_import(self):
 
@@ -313,7 +349,57 @@ class GmailRicoImporter:
 
         self.db_trades_df = db_trades_df
 
-    def resolve_tickers_with_db(
+    def get_assets_table(self):
+
+        TARGET_TABLE = "assets" 
+
+        connection = None
+        db_assets_df = pd.DataFrame() # Initialize an empty DataFrame
+
+        try:
+            # 1. Establish the connection
+            print(f"Connecting to the '{DB_NAME}' database...")
+            connection = psycopg2.connect(
+                host=DB_HOST,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                port=DB_PORT
+            )
+
+            self.connection = connection
+            
+            # 2. Define the SQL query
+            sql_query = f"SELECT ticker, company_name FROM {TARGET_TABLE};"
+            
+            # 3. Use pandas to execute the query and read directly into a DataFrame
+            print(f"Executing query: {sql_query}")
+            db_assets_df = pd.read_sql_query(
+                sql_query, 
+                connection # pandas handles the cursor and fetching internally
+            )
+            
+            # 4. Success message and data inspection
+            print("\n--- ✅ Data Extraction Successful ---")
+            print(f"DataFrame shape: {db_assets_df.shape}")
+            print("\n--- DataFrame Head ---")
+            print(db_assets_df.head())
+            
+        except Exception as e:
+            print(f"❌ Database connection or query error: {e}")
+            db_assets_df = pd.DataFrame() # Ensure DF is empty on failure
+
+        finally:
+            # Always close the connection
+            if connection:
+                connection.close()
+                print("\nDatabase connection closed.")
+
+        self.db_assets_df = db_assets_df
+    
+    
+
+    def resolve_tickers_with_db(self,
         df: pd.DataFrame, 
         database_df: pd.DataFrame,
         asset_column: str = 'asset', 
@@ -390,10 +476,8 @@ class GmailRicoImporter:
 
         format_date = "%d/%m/%Y"
 
-        date_object = datetime.strptime(self.trade_date, format_date)
+        date_object = datetime.datetime.strptime(self.trade_date, format_date)
         self.df['date'] = date_object.date()
-
-        current_cols = self.df.columns.tolist()
 
         new_order = ['date', 'side', 'ticker', 'asset', 'quantity', 'price','total','fee']
 
@@ -412,7 +496,7 @@ class GmailRicoImporter:
 
 
 
-    def resolve_portfolio_with_db(
+    def resolve_portfolio_with_db(self,
         df: pd.DataFrame, 
         database_df: pd.DataFrame,
         asset_column: str = 'asset', 
@@ -462,7 +546,7 @@ class GmailRicoImporter:
         return df_copy
 
     def resolve_trades_portfolio(self):
-        self.df = self.resolve_portfolio_with_db(self.db, self.db_trades_df, 'ticker', 'portfolio')
+        self.df = self.resolve_portfolio_with_db(self.df, self.db_trades_df, 'ticker', 'portfolio')
 
 
     def add_validated_trade_id_for_missing_robust(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -521,6 +605,84 @@ class GmailRicoImporter:
         final_order = ['trade_id','date', 'side', 'ticker', 'asset', 'quantity', 'price','total','fee','portfolio']
         self.df = self.df[final_order]
 
+    
+    def resolve_assets_with_db(self):
+        print("--- Checking assets table ---")
+
+        current_tickers = set(self.df['ticker'].unique())
+
+        existing_tickers = set(self.db_assets_df['ticker'].unique())
+
+        missing_tickers = current_tickers - existing_tickers
+
+        if not missing_tickers:
+            print('All tickers already exist in assets table')
+        
+        print(f'Found {len(missing_tickers)} new tickers to register')
+
+        new_assets = []
+
+        for ticker in missing_tickers:
+            yf_ticker = f'{ticker}.SA' if not ticker.endswith('.SA') else ticker
+            print(f'Fetching data for {yf_ticker}')
+
+            company_name = self.df[self.df['ticker'] == ticker]['asset'].iloc[0]
+            industry = 'Unknown'
+            sector = 'Unknown'
+
+            try:
+                stock = yf.Ticker(yf_ticker)
+                info = stock.info
+                industry = info.get('industry','Unknown')
+                sector = info.get('sector','Unknown')
+            except Exception as e:
+                print(f'Could not pull yfinance data for {ticker}: {e}')
+            
+            new_assets.append({
+                'ticker': ticker,
+                'company_name': company_name,
+                'sector':sector,
+                'industry':industry
+            })
+        
+        if new_assets:
+            new_assets_df = pd.DataFrame(new_assets)
+            buffer_asset = StringIO()
+            new_assets_df.to_csv(buffer_asset, header=False, index=False)
+            buffer_asset.seek(0)
+
+            assets_columns = new_assets_df.columns.to_list()
+
+            try:
+                connection = psycopg2.connect(
+                    host = DB_HOST, 
+                    database = DB_NAME,
+                    user = DB_USER,
+                    password = DB_PASSWORD,
+                    port = DB_PORT
+                )
+
+                with connection.cursor() as cur:
+                    cur.copy_from(
+                        file = buffer_asset, 
+                        table='assets',
+                        sep=',',
+                        columns=assets_columns
+                        )
+
+                    connection.commit()
+                    print(f'Successfully inserted {len(new_assets_df)} rows into assets table')
+
+            except Exception as e:
+                connection.rollback()
+                print(f'Database error: {e}')
+
+            finally:
+                connection.cursor.close()
+                connection.close()
+      
+
+
 
     def load_to_db(self):
         buffer = StringIO()
@@ -551,7 +713,7 @@ class GmailRicoImporter:
                 print(f'Successfully inserted {len(self.df)} rows into trades table')
 
         except Exception as e:
-            self.connection.rollback()
+            connection.rollback()
             print(f'Database error: {e}')
 
         finally:
@@ -561,10 +723,14 @@ class GmailRicoImporter:
 if __name__ == "__main__":
     import sys
     try:
-        GmailRicoImporter()
+        importer = GmailRicoImporter()
+        importer.run_pipeline()
         print("Trade statement import successful!")
+
     except Exception as e:
         print(f'Program error: {e}')
+        import traceback
+        traceback.print_exc()
 
 
 
