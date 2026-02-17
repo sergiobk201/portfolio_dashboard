@@ -8,6 +8,9 @@ import psycopg2
 from dotenv import load_dotenv
 import os
 import yfinance as yf
+from io import StringIO
+
+
 
 load_dotenv()
 UNRESOLVED_PLACEHOLDER = '!!!_INPUT_REQUIRED_!!!'
@@ -24,75 +27,123 @@ class DividendsPipeline():
     def __init__(self, file):
         self.file = file
 
-    def get_dividends_db(self):
+    def run_pipeline(self):
+        self.get_trades_db()
+        self.get_dividends_db()      
+        self.transform_file()     
+        self.df = self.add_validated_dividend_id_for_missing_robust(self.df)
+        self.resolve_trades_portfolio()
+        self.load_new_divs()
+
+    def get_trades_db(self):
 
         connection = None 
-        dividends_df_db = pd.DataFrame()
+        trades_df_db = pd.DataFrame()
 
         try:
             print('Connecting to database')
             connection = psycopg2.connect(
                 host = DB_HOST, 
                 database = DB_NAME, 
-                username = DB_USER, 
+                user = DB_USER, 
                 password = DB_PASSWORD, 
                 port = DB_PORT, 
             )
 
-            div_query = 'SELECT * FROM dividends;'
+            trades_query = 'SELECT ticker, portfolio FROM trades;'
             print('Executing query')
 
-            dividends_df_db = pd.read_sql_query(
-                div_query, 
+            trades_df_db = pd.read_sql_query(
+                trades_query, 
                 connection
             )
+
         except Exception as e:
             print(f'There was a database error: {e}')
-            dividends_df_db = pd.DataFrame()
+            trades_df_db = pd.DataFrame()
         
         finally:
             if connection:
                 connection.close()
                 print('Closing database connection')
             
-        self.div_df = dividends_df_db
+        self.trades_df = trades_df_db
+
+    def get_dividends_db(self):
+
+            connection = None 
+            div_df_db = pd.DataFrame()
+
+            try:
+                print('Connecting to database')
+                connection = psycopg2.connect(
+                    host = DB_HOST, 
+                    database = DB_NAME, 
+                    user = DB_USER, 
+                    password = DB_PASSWORD, 
+                    port = DB_PORT, 
+                )
+
+                div_query = 'SELECT * FROM dividends;'
+                print('Executing query')
+
+                div_df_db = pd.read_sql_query(
+                    div_query, 
+                    connection
+                )
+
+            except Exception as e:
+                print(f'There was a database error: {e}')
+                div_df_db = pd.DataFrame()
+            
+            finally:
+                if connection:
+                    connection.close()
+                    print('Closing database connection')
+                
+            self.div_df = div_df_db
 
     def transform_file(self):
         file = pd.read_excel(self.file, skiprows=13)
         file = file.iloc[:,[1,2,3,5,6]]
-        file.columns = ['transaction_date','clearing_date','description','transaction','balance']
-        first_null = file['transaction_date'].isna().argmax()
+        file.columns = ['dividend_date','clearing_date','description','total','balance']
+        first_null = file['dividend_date'].isna().argmax()
         file = file.iloc[:first_null]
 
-        file['transaction_date'] = pd.to_datetime(file['transaction_date'])
+        file['dividend_date'] = pd.to_datetime(file['dividend_date'])
         file['clearing_date'] = pd.to_datetime(file['clearing_date'])
-        file['transaction_date'] = file['transaction_date'].dt.date
+        file['dividend_date'] = file['dividend_date'].dt.date
         file['clearing_date'] = file['clearing_date'].dt.date
 
         file['type'] = file['description'].str.split().str[0]
         
         filtered = file.copy()
 
-        filtered = filtered[filtered['type'].isin(['JUROS','DIVIDENDS'])]
+        filtered = filtered[filtered['type'].isin(['JUROS','DIVIDENDOS'])]
         filtered['ticker'] = filtered['description'].str.split().str[-3]
         filtered['quantity'] = filtered['description'].str.split().str[-1]
 
         filtered['quantity'] = filtered['quantity'].astype('int32')
-        filtered['transaction'] = filtered['transaction'].astype('float64')
-        filtered['ind_transaction'] = (filtered['transaction'] / filtered['quantity']).round(2)
+        filtered['total'] = filtered['total'].astype('float64')
+        filtered['dividend'] = (filtered['total'] / filtered['quantity']).round(2)
+        filtered['portfolio'] = UNRESOLVED_PLACEHOLDER
+        filtered['dividend_id'] = None
 
+        filtered = filtered[['dividend_id', 'dividend_date', 'ticker','type', 'dividend', 'total','quantity', 'portfolio']]
+
+        self.df = filtered
 
     def add_validated_dividend_id_for_missing_robust(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Generates unique UUIDs only for rows where 'dividend_id' is missing (NaN/None),
         ensuring no collision and explicitly handling data types to prevent warnings.
         """
-        df_copy = self.div_df.copy()
+        df_copy = df.copy()
         
         # 1. Ensure the 'dividend_id' column exists, using 'object' dtype
         if 'dividend_id' not in df_copy.columns:
             # Create the column and immediately set its type to 'object' (string)
-            df_copy['t_id'] = pd.Series([np.nan] * len(df_copy), dtype='object')
+            df_copy['dividend_id'] = pd.Series([np.nan] * len(df_copy), dtype='object')
             print("💡 'dividend_id' column created as type 'object'.")
         else:
             # If it exists, cast it to 'object' to handle any prior float/mixed inference
@@ -130,119 +181,109 @@ class DividendsPipeline():
         print(f"✅ Successfully generated and assigned {num_missing} new, non-conflicting IDs.")
         return df_copy
 
+
+    def resolve_portfolio_with_db(self,
+        df: pd.DataFrame, 
+        database_df: pd.DataFrame,
+        asset_column: str = 'ticker', 
+        portfolio_column: str = 'portfolio'
+    ) -> pd.DataFrame:
+        """
+        1. Checks database_df for existing ticker-to-portfolio mappings.
+        2. Updates the main DataFrame with found mappings.
+        3. Prompts for manual input ONLY for assets still missing.
+        """
+        df_copy = self.df.copy()
+
+        # --- STEP 1: DATABASE LOOKUP ---
+        # Ensure database_df is cleaned for mapping
+        mapping_dict = database_df.set_index(asset_column)[portfolio_column].to_dict()
+
+        # Apply mapping where the portfolio is currently missing or placeholder
+        mask = (df_copy[portfolio_column] == UNRESOLVED_PLACEHOLDER) | df_copy[portfolio_column].isna()
+        
+        # Map the assets to known portfolios
+        df_copy.loc[mask, portfolio_column] = df_copy.loc[mask, asset_column].map(mapping_dict)
+
+        # --- STEP 2: MANUAL INPUT FOR REMAINING ---
+        # Re-evaluate unresolved indices after DB update
+        unresolved_indices = df_copy[
+            (df_copy[portfolio_column] == UNRESOLVED_PLACEHOLDER) | df_copy[portfolio_column].isna()
+        ].index.tolist()
+
+        if not unresolved_indices:
+            print("✅ All portfolios resolved via Database.")
+            return df_copy
+
+        print(f"--- {len(unresolved_indices)} Trades still require MANUAL INPUT ---")
+        
+        for idx in unresolved_indices:
+            asset_name = df_copy.loc[idx, asset_column]
+            try:
+                new_portfolio = input(f"[{idx}] Enter Portfolio for '{asset_name}': ")
+                if new_portfolio.strip():
+                    df_copy.loc[idx, portfolio_column] = new_portfolio.strip().upper()
+                    print(f"✅ Assigned '{new_portfolio.strip().upper()}' to '{asset_name}'.")
+                else:
+                    df_copy.loc[idx, portfolio_column] = UNRESOLVED_PLACEHOLDER
+            except EOFError:
+                df_copy.loc[idx, portfolio_column] = UNRESOLVED_PLACEHOLDER
+            
+        return df_copy
+
+    def resolve_trades_portfolio(self):
+        self.df = self.resolve_portfolio_with_db(self.df, self.trades_df, 'ticker', 'portfolio')
+
+
     def load_new_divs(self):
         buffer = StringIO()
+        self.df.to_csv(buffer, header=False, index=False)
+        buffer.seek(0)
+
+        columns = self.df.columns.to_list()
+
+        connection = None 
+
+        try:
+            print('Connection to database')
+            connection = psycopg2.connect(
+                host = DB_HOST, 
+                database = DB_NAME, 
+                user = DB_USER, 
+                password = DB_PASSWORD,
+                port = DB_PORT
+            )
+
+        except Exception as e:
+            print(f'Database error: {e}')
+
+        try:
+            with connection.cursor() as cur:
+                cur.copy_from(
+                    file = buffer, 
+                    table = 'dividends',
+                    sep = ',',
+                    columns = columns
+                )
+                connection.commit()
+                print(f'Successfully loaded {len(self.df)} rows to dividends table')
+        
+        except Exception as e:
+            connection.rollback()
+            print(f'Database error: {e}')
 
 
-# from io import StringIO
-
-# buffer = StringIO()
-
-# df.to_csv(buffer, header=False, index=False)
-
-# buffer.seek(0)
-
-# columns = df.columns.to_list()
-
-# Use database to simplify 
-
-
-
-# %%
-import yfinance as yf
-
-def get_stock_sector(ticker_symbol):
+if __name__ == "__main__":
+    import sys
     try:
-        # For B3 stocks, add '.SA' (e.g., 'AAPL34.SA' or 'PETR4.SA')
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        
-        sector = info.get('sector', 'Unknown')
-        industry = info.get('industry', 'Unknown')
-        
-        return sector, industry
+        file_path = input("Drag and drop dividends file here").strip(' "\'')
+        dividend_loader = DividendsPipeline(file_path)
+        dividend_loader.run_pipeline()
+        print("Dividends loaded successfully!")
+
     except Exception as e:
-        return None, str(e)
+        print(f'Program error: {e}')
+        import traceback
+        traceback.print_exc()
 
-# Example for Apple BDR in Brazil
-sector, industry = get_stock_sector("AAPL34.SA")
-print(f"Sector: {sector} | Industry: {industry}")
-
-# %%
-list_tickers['ticker_search'] = list_tickers['ticker'] + ".SA"
-
-# %%
-list_tickers[['sector','industry']] = list_tickers['ticker_search'].apply(lambda x: pd.Series(get_stock_sector(x)))
-
-# %%
-list_tickers.to_excel('tickers.xlsx', index=False)
-
-# %%
-final_tickers = pd.read_excel('tickers.xlsx')
-final_tickers
-
-# %%
-final_tickers = final_tickers.rename(columns={'asset':'company_name'})
-final_tickers
-
-# %%
-from io import StringIO
-
-buffer = StringIO()
-
-final_tickers.to_csv(buffer, header=False, index=False)
-
-buffer.seek(0)
-
-columns = final_tickers.columns.to_list()
-
-import pandas as pd
-import numpy as np
-import psycopg2
-import os
-
-# --- Configuration (Use your environment variables) ---
-DB_HOST = os.environ.get("host")
-DB_NAME = os.environ.get("dbname")
-DB_USER = os.environ.get("user")
-DB_PASSWORD = os.environ.get("password")
-DB_PORT = 5432
-
-connection = None
-trades_df = pd.DataFrame() # Initialize an empty DataFrame
-
-try:
-    # 1. Establish the connection
-    print(f"Connecting to the '{DB_NAME}' database...")
-    connection = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        port=DB_PORT
-    )
-    
-except Exception as e:
-    print(f"❌ Database connection or query error: {e}")
-    trades_df = pd.DataFrame() # Ensure DF is empty on failure
-
-
-try:
-    with connection.cursor() as cur:
-        cur.copy_from(
-            file=buffer,
-            table = 'assets',
-            sep=",",
-            columns=columns
-        )
-
-        connection.commit()
-        print(f'Successfully inserted {len(final_tickers)} rows into trades table')
-
-except Exception as e:
-    connection.rollback()
-    print(f'Database error: {e}')
-
-
-
-#TODO: add portfolio method and divId method 
+#TODO fix the dividend ID generator and test
