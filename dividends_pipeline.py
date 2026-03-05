@@ -117,25 +117,27 @@ class DividendsPipeline:
 
         filtered = file.copy()
 
-        filtered = filtered[filtered["type"].isin(["JUROS", "DIVIDENDOS","FRAÇÕES", "RENDIMENTOS"])]
+        filtered = filtered[
+            filtered["type"].isin(["JUROS", "DIVIDENDOS", "FRAÇÕES", "RENDIMENTOS"])
+        ]
 
         # 1. Split the description into a list of words
         description_split = filtered["description"].str.split()
 
         # 2. Define the condition
-        is_standard_type = filtered['type'].isin(['JUROS', 'DIVIDENDOS', 'RENDIMENTOS'])
+        is_standard_type = filtered["type"].isin(["JUROS", "DIVIDENDOS", "RENDIMENTOS"])
 
         # 3. Use np.where (Condition, Value if True, Value if False)
         filtered["ticker"] = np.where(
             is_standard_type,
-            description_split.str[-3], # Standard ticker position
-            description_split.str[-1]  # FRAÇÕES ticker position
+            description_split.str[-3],  # Standard ticker position
+            description_split.str[-1],  # FRAÇÕES ticker position
         )
 
         filtered["quantity"] = np.where(
             is_standard_type,
-            description_split.str[-1], # Standard quantity position
-            "1"                        # Default for FRAÇÕES
+            description_split.str[-1],  # Standard quantity position
+            "1",  # Default for FRAÇÕES
         )
 
         filtered["quantity"] = filtered["quantity"].astype("int32")
@@ -159,8 +161,8 @@ class DividendsPipeline:
 
         self.df = filtered
 
-    def add_validated_dividend_id_for_missing_robust(self, 
-        df: pd.DataFrame, db_df: pd.DataFrame = None
+    def add_validated_dividend_id_for_missing_robust(
+        self, df: pd.DataFrame, db_df: pd.DataFrame = None
     ) -> pd.DataFrame:
         """
         generates unique uuids for rows missing 'dividend_id'.
@@ -239,12 +241,17 @@ class DividendsPipeline:
             .to_dict()
         )
 
-        mask = (df_copy[portfolio_column] == unresolved_placeholder) | df_copy[portfolio_column].isna()
-        df_copy.loc[mask, portfolio_column] = df_copy.loc[mask, asset_column].map(mapping_dict)
+        mask = (df_copy[portfolio_column] == unresolved_placeholder) | df_copy[
+            portfolio_column
+        ].isna()
+        df_copy.loc[mask, portfolio_column] = df_copy.loc[mask, asset_column].map(
+            mapping_dict
+        )
 
         # Re-check for what is still unresolved
         unresolved_indices = df_copy[
-            (df_copy[portfolio_column] == unresolved_placeholder) | df_copy[portfolio_column].isna()
+            (df_copy[portfolio_column] == unresolved_placeholder)
+            | df_copy[portfolio_column].isna()
         ].index.tolist()
 
         if not unresolved_indices:
@@ -311,6 +318,7 @@ class DividendsPipeline:
             if connection:
                 connection.close()
 
+
 if __name__ == "__main__":
     import sys
 
@@ -323,5 +331,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"program error: {e}")
         import traceback
-        traceback.print_exc()
 
+        traceback.print_exc()
