@@ -188,10 +188,7 @@ class PricePipeline:
 
         except Exception as e:
             print(f"database error: {e}")
-
-        finally:
-            if connection:
-                connection.close()
+            raise e
 
     def run(self):
         tickers = self.fetch_active_tickers()
