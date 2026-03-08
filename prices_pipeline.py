@@ -25,7 +25,7 @@ class PricePipeline:
         self.current_date = date.today()
 
     def get_db_connection(self):
-        return psycopg2.connect(**self.db_config)
+        return psycopg2.connect(**self.db_config, sslmode="require", connect_timeout=10)
 
     def fetch_active_tickers(self):
 
@@ -55,7 +55,7 @@ class PricePipeline:
 
         except Exception as e:
             print(f"Database error: {e}")
-            return []
+            raise e
 
     def send_manual_alert(self, ticker: str) -> None:
         """Sends a formatted SQL query to fix price pipeline errors"""
@@ -191,6 +191,10 @@ class PricePipeline:
             raise e
 
     def run(self):
+        # if date.today().weekday() >= 5:
+        #     print('Weekend detected. Skipping fetch today')
+        #     return
+
         tickers = self.fetch_active_tickers()
         if not tickers:
             print("No active tickers")
