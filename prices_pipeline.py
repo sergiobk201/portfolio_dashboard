@@ -1,7 +1,6 @@
 # Imports
 import yfinance as yf
 import os
-from brapi import Brapi
 import pandas as pd
 from dotenv import load_dotenv
 import psycopg2
