@@ -1,5 +1,4 @@
 yfinance
-brapi-python
 pandas
 python-dotenv
 psycopg2-binary
