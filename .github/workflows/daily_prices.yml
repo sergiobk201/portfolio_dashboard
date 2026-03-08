@@ -1,0 +1,28 @@
+name: Daily Portfolio Stock Price Fetch
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup python
+        run: pip install -r prices_requirements.txt
+
+      - name: Run pipeline
+        env:
+          host: ${{ secrets.DB_HOST }}
+          dbname: ${{ secrets.DB_NAME }}
+          user: ${{ secrets.DB_USER }}
+          password: ${{ secrets.DB_PASSWORD }}
+          port: ${{ secrets.DB_PORT }}
+          BRAPI_KEY: ${{ secrets.BRAPI_KEY }}
+          PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
+          PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
+        run: python prices_pipeline.py
