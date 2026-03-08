@@ -191,9 +191,9 @@ class PricePipeline:
             raise e
 
     def run(self):
-        # if date.today().weekday() >= 5:
-        #     print('Weekend detected. Skipping fetch today')
-        #     return
+        if date.today().weekday() >= 5:
+            print("Weekend detected. Skipping fetch today")
+            return
 
         tickers = self.fetch_active_tickers()
         if not tickers:
