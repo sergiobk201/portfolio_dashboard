@@ -1,4 +1,5 @@
 # Imports
+from sqlalchemy.sql.functions import current_date
 import yfinance as yf
 import os
 import pandas as pd
@@ -102,20 +103,32 @@ class PricePipeline:
 
                     if history:
                         latest = history[-1]
+                        latest2 = history[-2]
 
                         if latest["close"] is not None:
                             clean_date = pd.to_datetime(latest["date"], unit="s").date()
 
-                            results.append(
-                                {
-                                    "ticker": stock["symbol"],
-                                    "price": latest["close"],
-                                    "date": clean_date,
-                                }
-                            )
+                            if clean_date == self.current_date:
+                                results.append(
+                                    {
+                                        "ticker": stock["symbol"],
+                                        "price": latest2["close"],
+                                        "date": pd.to_datetime(
+                                            latest2["date"], unit="s"
+                                        ).date(),
+                                    }
+                                )
+                            else:
+                                results.append(
+                                    {
+                                        "ticker": stock["symbol"],
+                                        "price": latest["close"],
+                                        "date": clean_date,
+                                    }
+                                )
 
-                            print(f"Success pull from BRAPI for ticker {ticker}")
-                            success = True
+                                print(f"Success pull from BRAPI for ticker {ticker}")
+                                success = True
 
             except Exception as e:
                 print(f"Brapi error: {e}")
@@ -126,7 +139,7 @@ class PricePipeline:
                 try:
                     print(f"Falling back to layer 2 for ticker {ticker}")
                     yf_ticker = f"{ticker}.SA" if "-" not in ticker else ticker
-                    data_yf = yf.download(yf_ticker, period="1d", progress=False)
+                    data_yf = yf.download(yf_ticker, period="5d", progress=False)
 
                     if (
                         data_yf is not None
@@ -134,18 +147,33 @@ class PricePipeline:
                         and "Close" in data_yf.columns
                     ):
                         last_price = data_yf["Close"].iloc[-1]
+                        last_price2 = data_yf["Close"].iloc[-2]
 
                         if not pd.isna(last_price):
                             last_date = pd.to_datetime(data_yf.index[-1]).date()
-                            results.append(
-                                {
-                                    "ticker": ticker,
-                                    "price": float(last_price),
-                                    "date": last_date,
-                                }
-                            )
-                            print(f"Yahoo Finance pull successful for ticker: {ticker}")
-                            success = True
+
+                            if last_date == self.current_date:
+                                results.append(
+                                    {
+                                        "ticker": ticker,
+                                        "price": float(last_price2),
+                                        "date": pd.to_datetime(
+                                            data_yf.index[-2]
+                                        ).date(),
+                                    }
+                                )
+                            else:
+                                results.append(
+                                    {
+                                        "ticker": ticker,
+                                        "price": float(last_price),
+                                        "date": last_date,
+                                    }
+                                )
+                                print(
+                                    f"Yahoo Finance pull successful for ticker: {ticker}"
+                                )
+                                success = True
 
                     else:
                         print(f"Yahoo Finance returned no date for {ticker}")
