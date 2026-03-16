@@ -92,7 +92,7 @@ class PricePipeline:
 
             # Layer 1: BRAPI
             try:
-                url = f"https://brapi.dev/api/quote/{ticker}?range=1d&interval=1d&fundamental=false"
+                url = f"https://brapi.dev/api/quote/{ticker}?range=5d&interval=1d&fundamental=false"
                 params = {"token": self.brapi_key}
                 response = requests.get(url, params=params, timeout=10)
 
@@ -118,6 +118,8 @@ class PricePipeline:
                                         ).date(),
                                     }
                                 )
+                                print(f"Success pull from BRAPI for ticker {ticker}")
+                                success = True
                             else:
                                 results.append(
                                     {
@@ -162,6 +164,8 @@ class PricePipeline:
                                         ).date(),
                                     }
                                 )
+                                success = True
+
                             else:
                                 results.append(
                                     {
