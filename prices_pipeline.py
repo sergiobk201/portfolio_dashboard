@@ -105,7 +105,7 @@ class PricePipeline:
                         latest = history[-1]
                         latest2 = history[-2]
 
-                        if latest["close"] is not None:
+                        if latest["close"] is not None and latest2["close"] is not None:
                             clean_date = pd.to_datetime(latest["date"], unit="s").date()
 
                             if clean_date == self.current_date:
@@ -151,7 +151,7 @@ class PricePipeline:
                         last_price = data_yf["Close"].iloc[-1]
                         last_price2 = data_yf["Close"].iloc[-2]
 
-                        if not pd.isna(last_price):
+                        if not pd.isna(last_price) and not pd.isna(last_price2):
                             last_date = pd.to_datetime(data_yf.index[-1]).date()
 
                             if last_date == self.current_date:
