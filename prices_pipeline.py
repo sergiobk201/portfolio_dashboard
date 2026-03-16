@@ -1,12 +1,10 @@
 # Imports
-from sqlalchemy.sql.functions import current_date
 import yfinance as yf
 import os
 import pandas as pd
 from dotenv import load_dotenv
 import psycopg2
 import requests
-import json
 import time
 from datetime import date
 from io import StringIO
@@ -102,35 +100,28 @@ class PricePipeline:
                     history = stock.get("historicalDataPrice", [])
 
                     if history:
-                        latest = history[-1]
-                        latest2 = history[-2]
+                        completed = [
+                            h
+                            for h in history
+                            if h["close"] is not None
+                            and pd.to_datetime(h["date"], unit="s").date()
+                            != self.current_date
+                        ]
 
-                        if latest["close"] is not None and latest2["close"] is not None:
-                            clean_date = pd.to_datetime(latest["date"], unit="s").date()
+                        if completed:
+                            last_completed = completed[-1]
+                            results.append(
+                                {
+                                    "ticker": stock["symbol"],
+                                    "price": last_completed["close"],
+                                    "date": pd.to_datetime(
+                                        last_completed["date"], unit="s"
+                                    ).date(),
+                                }
+                            )
 
-                            if clean_date == self.current_date:
-                                results.append(
-                                    {
-                                        "ticker": stock["symbol"],
-                                        "price": latest2["close"],
-                                        "date": pd.to_datetime(
-                                            latest2["date"], unit="s"
-                                        ).date(),
-                                    }
-                                )
-                                print(f"Success pull from BRAPI for ticker {ticker}")
-                                success = True
-                            else:
-                                results.append(
-                                    {
-                                        "ticker": stock["symbol"],
-                                        "price": latest["close"],
-                                        "date": clean_date,
-                                    }
-                                )
-
-                                print(f"Success pull from BRAPI for ticker {ticker}")
-                                success = True
+                            print(f"Success pull from BRAPI for ticker {ticker}")
+                            success = True
 
             except Exception as e:
                 print(f"Brapi error: {e}")
@@ -148,36 +139,29 @@ class PricePipeline:
                         and not data_yf.empty
                         and "Close" in data_yf.columns
                     ):
-                        last_price = data_yf["Close"].iloc[-1]
-                        last_price2 = data_yf["Close"].iloc[-2]
+                        data_yf_filtered = data_yf[
+                            data_yf.index.date != self.current_date
+                        ]
 
-                        if not pd.isna(last_price) and not pd.isna(last_price2):
-                            last_date = pd.to_datetime(data_yf.index[-1]).date()
+                        if not data_yf_filtered.empty:
+                            last_price = float(data_yf_filtered["Close"].iloc[-1])
+                            last_date = pd.to_datetime(
+                                data_yf_filtered.index[-1]
+                            ).date()
 
-                            if last_date == self.current_date:
+                            if not pd.isna(last_price):
                                 results.append(
                                     {
                                         "ticker": ticker,
-                                        "price": float(last_price2),
-                                        "date": pd.to_datetime(
-                                            data_yf.index[-2]
-                                        ).date(),
-                                    }
-                                )
-                                success = True
-
-                            else:
-                                results.append(
-                                    {
-                                        "ticker": ticker,
-                                        "price": float(last_price),
+                                        "price": last_price,
                                         "date": last_date,
                                     }
                                 )
+                                success = True
+
                                 print(
                                     f"Yahoo Finance pull successful for ticker: {ticker}"
                                 )
-                                success = True
 
                     else:
                         print(f"Yahoo Finance returned no date for {ticker}")
@@ -210,8 +194,6 @@ class PricePipeline:
         buffer.seek(0)
 
         columns = df.columns.to_list()
-
-        connection = None
 
         try:
             print("connection to database")
