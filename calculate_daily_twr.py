@@ -90,20 +90,22 @@ DB_CONFIG = {
     "password": os.environ.get("password"),
     "port": os.environ.get("port"),
 }
-TG_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]
-TABLE         = "price_performance"
-WINDOW_DAYS   = 35   # how far back to recalculate (covers T+2 trades + T+30 divs)
+TG_TOKEN = os.environ["PORT_BOT_TOKEN"]
+TG_CHAT_ID = os.environ["PORT_BOT_CHAT"]
+TABLE = "portfolio_performance"
+WINDOW_DAYS = 35  # how far back to recalculate (covers T+2 trades + T+30 divs)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     return psycopg2.connect(**DB_CONFIG, sslmode="require")
 
+
 def send_telegram(message: str) -> None:
     """Fire-and-forget Telegram alert."""
-    url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, data=data, timeout=10)
@@ -120,22 +122,24 @@ def pct(v: float) -> str:
 # ── Connect, Fetch, Calculate & Upsert ────────────────────────────────────────
 with get_db_connection() as conn:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-
         # ── Date window ────────────────────────────────────────────────────────
-        yesterday    = date.today() - timedelta(days=1)
+        yesterday = date.today() - timedelta(days=1)
         window_start = yesterday - timedelta(days=WINDOW_DAYS - 1)
-        window_end   = yesterday
+        window_end = yesterday
 
         print(f"[TWR] Window: {window_start} → {window_end}  ({WINDOW_DAYS} days)")
 
         # ── 1. Anchor row ──────────────────────────────────────────────────────
-        cur.execute(f"""
+        cur.execute(
+            f"""
             SELECT date, portfolio_value, uninvested_cash, total_invested, twr, equity_value 
             FROM {TABLE}
             WHERE date < %s
             ORDER BY date DESC
             LIMIT 1
-        """, (window_start.isoformat(),))
+        """,
+            (window_start.isoformat(),),
+        )
         anchor = cur.fetchone()
 
         if not anchor:
@@ -148,17 +152,22 @@ with get_db_connection() as conn:
             )
             sys.exit(1)
 
-        anchor_date      = anchor["date"]
+        anchor_date = anchor["date"]
         anchor_portfolio = float(anchor["portfolio_value"])
-        anchor_cash      = float(anchor["uninvested_cash"])
+        anchor_cash = float(anchor["uninvested_cash"])
         anchor_total_inv = float(anchor["total_invested"])
-        anchor_twr       = float(anchor["twr"])
-        anchor_equity    = float(anchor["equity_value"])
+        anchor_twr = float(anchor["twr"])
+        anchor_equity = float(anchor["equity_value"])
 
-        print(f"[TWR] Anchor     : {anchor_date}  portfolio={anchor_portfolio:,.2f}  twr={pct(anchor_twr)}")
+        print(
+            f"[TWR] Anchor     : {anchor_date}  portfolio={anchor_portfolio:,.2f}  twr={pct(anchor_twr)}"
+        )
 
         # ── 2. Batch load equity values for the entire window ──────────────────
-        cur.execute("SELECT * FROM get_equity_values_range(%s, %s)", (window_start.isoformat(), window_end.isoformat()))
+        cur.execute(
+            "SELECT * FROM get_equity_values_range(%s, %s)",
+            (window_start.isoformat(), window_end.isoformat()),
+        )
         equity_data = cur.fetchall()
 
         if not equity_data:
@@ -171,17 +180,22 @@ with get_db_connection() as conn:
             sys.exit(1)
 
         equity_by_date = {
-            row["date"].isoformat() if isinstance(row["date"], date) else row["date"]: float(row["equity_value"])
+            row["date"].isoformat()
+            if isinstance(row["date"], date)
+            else row["date"]: float(row["equity_value"])
             for row in equity_data
         }
         print(f"[TWR] Equity rows fetched: {len(equity_by_date)} trading days")
 
         # ── 3. Batch load trades in the window ────────────────────────────────
-        cur.execute("""
-            SELECT date, side, total_cost, fee 
+        cur.execute(
+            """
+            SELECT date, side, total, fee 
             FROM trades 
             WHERE date >= %s AND date <= %s
-        """, (window_start.isoformat(), window_end.isoformat()))
+        """,
+            (window_start.isoformat(), window_end.isoformat()),
+        )
         trades_data = cur.fetchall()
 
         trades_by_date: dict[str, dict] = {}
@@ -189,36 +203,43 @@ with get_db_connection() as conn:
             d = r["date"].isoformat() if isinstance(r["date"], date) else r["date"]
             if d not in trades_by_date:
                 trades_by_date[d] = {"buys": 0.0, "sells": 0.0}
-            cost = float(r["total_cost"])
-            fee  = float(r["fee"])
+            cost = float(r["total"])
+            fee = float(r["fee"])
             if r["side"] == "BUY":
-                trades_by_date[d]["buys"]  += cost + fee
+                trades_by_date[d]["buys"] += cost + fee
             else:
                 trades_by_date[d]["sells"] += cost - fee
 
         print(f"[TWR] Trade dates in window: {len(trades_by_date)}")
 
         # ── 4. Batch load dividends in the window ──────────────────────────────
-        cur.execute("""
+        cur.execute(
+            """
             SELECT dividend_date, total 
             FROM dividends 
             WHERE dividend_date >= %s AND dividend_date <= %s
-        """, (window_start.isoformat(), window_end.isoformat()))
+        """,
+            (window_start.isoformat(), window_end.isoformat()),
+        )
         divs_data = cur.fetchall()
 
         divs_by_date: dict[str, float] = {}
         for r in divs_data:
-            d = r["dividend_date"].isoformat() if isinstance(r["dividend_date"], date) else r["dividend_date"]
+            d = (
+                r["dividend_date"].isoformat()
+                if isinstance(r["dividend_date"], date)
+                else r["dividend_date"]
+            )
             divs_by_date[d] = divs_by_date.get(d, 0.0) + float(r["total"])
 
         print(f"[TWR] Dividend dates in window: {len(divs_by_date)}")
 
         # ── 5. Walk forward through the window, recalculating each day ────────
         prev_portfolio = anchor_portfolio
-        prev_cash      = anchor_cash
+        prev_cash = anchor_cash
         prev_total_inv = anchor_total_inv
-        prev_twr       = anchor_twr
-        prev_equity    = anchor_equity
+        prev_twr = anchor_twr
+        prev_equity = anchor_equity
 
         rows_to_upsert = []
 
@@ -227,38 +248,40 @@ with get_db_connection() as conn:
             date_str = current.isoformat()
 
             equity_value = equity_by_date.get(date_str, prev_equity)
-            flows        = trades_by_date.get(date_str, {"buys": 0.0, "sells": 0.0})
-            buys         = flows["buys"]
-            sells        = flows["sells"]
-            divs         = divs_by_date.get(date_str, 0.0)
+            flows = trades_by_date.get(date_str, {"buys": 0.0, "sells": 0.0})
+            buys = flows["buys"]
+            sells = flows["sells"]
+            divs = divs_by_date.get(date_str, 0.0)
 
             cash_before_inflow = prev_cash + sells + divs - buys
-            external_inflow    = max(0.0, -cash_before_inflow)
-            uninvested_cash    = cash_before_inflow + external_inflow
+            external_inflow = max(0.0, -cash_before_inflow)
+            uninvested_cash = cash_before_inflow + external_inflow
 
             portfolio_value = equity_value + uninvested_cash
-            total_invested  = prev_total_inv + external_inflow
+            total_invested = prev_total_inv + external_inflow
 
-            denom        = prev_portfolio + external_inflow
+            denom = prev_portfolio + external_inflow
             daily_return = float(portfolio_value / denom - 1) if denom != 0 else 0.0
-            twr          = float((1 + prev_twr) * (1 + daily_return) - 1)
+            twr = float((1 + prev_twr) * (1 + daily_return) - 1)
 
-            rows_to_upsert.append({
-                "date"            : date_str,
-                "portfolio_value" : round(portfolio_value, 6),
-                "equity_value"    : round(equity_value,    6),
-                "uninvested_cash" : round(uninvested_cash, 6),
-                "total_invested"  : round(total_invested,  6),
-                "external_inflow" : round(external_inflow, 6),
-                "daily_return"    : round(daily_return,    8),
-                "twr"             : round(twr,             8),
-            })
+            rows_to_upsert.append(
+                {
+                    "date": date_str,
+                    "portfolio_value": round(portfolio_value, 6),
+                    "equity_value": round(equity_value, 6),
+                    "uninvested_cash": round(uninvested_cash, 6),
+                    "total_invested": round(total_invested, 6),
+                    "external_inflow": round(external_inflow, 6),
+                    "daily_return": round(daily_return, 8),
+                    "twr": round(twr, 8),
+                }
+            )
 
             prev_portfolio = portfolio_value
-            prev_cash      = uninvested_cash
+            prev_cash = uninvested_cash
             prev_total_inv = total_invested
-            prev_twr       = twr
-            prev_equity    = equity_value
+            prev_twr = twr
+            prev_equity = equity_value
 
             current += timedelta(days=1)
 
@@ -281,14 +304,22 @@ with get_db_connection() as conn:
         """
         data_tuples = [
             (
-                r["date"], r["portfolio_value"], r["equity_value"], r["uninvested_cash"],
-                r["total_invested"], r["external_inflow"], r["daily_return"], r["twr"]
+                r["date"],
+                r["portfolio_value"],
+                r["equity_value"],
+                r["uninvested_cash"],
+                r["total_invested"],
+                r["external_inflow"],
+                r["daily_return"],
+                r["twr"],
             )
             for r in rows_to_upsert
         ]
         execute_values(cur, upsert_query, data_tuples)
         conn.commit()
-        print(f"[TWR] ✓ Upserted {len(rows_to_upsert)} rows  ({window_start} → {window_end})")
+        print(
+            f"[TWR] ✓ Upserted {len(rows_to_upsert)} rows  ({window_start} → {window_end})"
+        )
 
 # ── 7. Sanity checks on yesterday's row → Telegram alerts ────────────────────
 #
@@ -304,8 +335,8 @@ with get_db_connection() as conn:
 #   C. Cumulative TWR is negative
 #      → portfolio is underwater on a time-weighted basis
 #
-yesterday_row = rows_to_upsert[-1]   # last item in the window = yesterday
-prev_row      = rows_to_upsert[-2] if len(rows_to_upsert) >= 2 else None
+yesterday_row = rows_to_upsert[-1]  # last item in the window = yesterday
+prev_row = rows_to_upsert[-2] if len(rows_to_upsert) >= 2 else None
 
 alerts = []
 
