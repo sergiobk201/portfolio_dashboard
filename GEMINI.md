@@ -7,6 +7,7 @@ Automated ingestion of dividend, trade, and price data to provide a transparent,
 - **Language:** Python 3.x
 - **Database:** Supabase (PostgreSQL)
 - **Frontend:** Streamlit (v1 Prototype) -> Dash (Target)
+- **Visualization:** Plotly (Interactive financial charts, TWR time series, and asset allocation donuts)
 - **Infrastructure:** GitHub Actions (Daily Price & TWR updates)
 - **Data Sources:** Gmail Automation (Trade/Dividend notices), Market Data APIs (Prices)
 

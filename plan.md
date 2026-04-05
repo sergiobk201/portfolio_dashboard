@@ -11,9 +11,9 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 ## 🗺 Roadmap
 
 ### [ ] Phase 1: Preparation
-- [ ] Verify Supabase schema for `dividends`, `trades`, and `daily_prices`.
-- [ ] Confirm TWR (Time-Weighted Return) calculation consistency.
-- [ ] Research Streamlit-friendly financial visualization libraries (`plotly`, `altair`).
+- [X] Verify Supabase schema for `dividends`, `trades`, and `daily_prices`.
+- [X] Confirm TWR (Time-Weighted Return) calculation consistency.
+- [X] Research Streamlit-friendly financial visualization libraries (Selected: Plotly).
 
 ### [ ] Phase 2: Streamlit v1 Implementation
 - [ ] Implement data fetching logic for Supabase (using `supabase-py`).
