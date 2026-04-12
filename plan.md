@@ -16,7 +16,7 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - [X] Research Streamlit-friendly financial visualization libraries (Selected: Plotly).
 
 ### [ ] Phase 2: Streamlit v1 Implementation
-- [ ] Implement data fetching logic for Supabase (using `supabase-py`).
+- [X] Implement data fetching logic for Supabase (using `psycopg2`).
 - [ ] Build "Portfolio Overview" (Total Value, TWR, Asset Allocation).
 - [ ] Build "Dividend Tracker" (Annual Yield, Monthly Income, Forecast).
 - [ ] Build "Trade History" (Recent Activity, P&L by position).
