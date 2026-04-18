@@ -7,20 +7,21 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - **Phase 1: Research & Setup (Days 1-2):** Map database schema and select frontend components.
 - **Phase 2: Streamlit Prototype (Days 3-7):** Functional v1 dashboard.
 - **Phase 3: Refinement & Dash Migration (Days 8-14):** Advanced styling and interactive reporting features.
+- **Phase 4: Investor-Ready Dashboard (Public Mode):** Masking BRL amounts and focusing on relative performance.
 
 ## 🗺 Roadmap
 
-### [ ] Phase 1: Preparation
+### [X] Phase 1: Preparation
 - [X] Verify Supabase schema for `dividends`, `trades`, and `daily_prices`.
 - [X] Confirm TWR (Time-Weighted Return) calculation consistency.
 - [X] Research Streamlit-friendly financial visualization libraries (Selected: Plotly).
 
-### [ ] Phase 2: Streamlit v1 Implementation
+### [X] Phase 2: Streamlit v1 Implementation
 - [X] Implement data fetching logic for Supabase (using `psycopg2`).
-- [ ] Build "Portfolio Overview" (Total Value, TWR, Asset Allocation).
-- [ ] Build "Dividend Tracker" (Annual Yield, Monthly Income, Forecast).
-- [ ] Build "Trade History" (Recent Activity, P&L by position).
-- [ ] Add sidebar filters for Date Range (Quarterly/Yearly) and Ticker.
+- [X] Build "Portfolio Overview" (Total Value, TWR, Asset Allocation).
+- [X] Build "Dividend Tracker" (Annual Yield, Monthly Income, Forecast).
+- [X] Build "Trade History" (Recent Activity, P&L by position).
+- [X] Add sidebar filters for Date Range (Quarterly/Yearly) and Ticker.
 
 ### [ ] Phase 3: Reporting & Polish
 - [ ] Generate a "Quarterly PDF Report" export feature.
@@ -28,5 +29,12 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - [ ] Style the app with custom CSS to match an institutional/professional look.
 - [ ] (Optional) Begin migration of complex components to Dash for enhanced interactivity.
 
+### [ ] Phase 4: Investor-Ready Dashboard (Public Mode)
+- [ ] Implement "Public Mode" toggle to mask all absolute BRL (R$) amounts.
+- [ ] Rebase performance tracking to a **Base 1000** index for growth visualization.
+- [ ] Pivot "Top Holdings" and "Trades" to focus on % Weights and Units.
+- [ ] Standardize metrics to TWR, Dividend Yield %, and Relative Contribution.
+- [ ] Ensure no nominal currency figures are inferable from the UI.
+
 ## 🚀 Next Step
-- **Review Supabase connection credentials and verify the current state of data in the tables.**
+- **Implement the "Public Mode" logic in `app.py` to support the Base 1000 re-basing.**
