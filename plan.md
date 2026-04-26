@@ -24,14 +24,11 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - [X] Add sidebar filters for Date Range (Quarterly/Yearly) and Ticker.
 
 ### [ ] Phase 3: Reporting & Polish
-- [ ] Generate a "Quarterly PDF Report" export feature.
-- [ ] Implement interactive Plotly charts for cumulative returns vs. benchmark (S&P 500).
-- [ ] Style the app with custom CSS to match an institutional/professional look.
-- [ ] (Optional) Begin migration of complex components to Dash for enhanced interactivity.
+- [X] Implement interactive Plotly charts for cumulative returns vs. benchmark (S&P 500).
+- [X] Style the app with custom CSS to match an institutional/professional look.
 
 ### [ ] Phase 4: Investor-Ready Dashboard (Public Mode)
 - [ ] Implement "Public Mode" toggle to mask all absolute BRL (R$) amounts.
-- [ ] Rebase performance tracking to a **Base 1000** index for growth visualization.
 - [ ] Pivot "Top Holdings" and "Trades" to focus on % Weights and Units.
 - [ ] Standardize metrics to TWR, Dividend Yield %, and Relative Contribution.
 - [ ] Ensure no nominal currency figures are inferable from the UI.
