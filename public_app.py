@@ -78,7 +78,11 @@ st.markdown(
 )
 
 # Load environment variables for database connectivity
-load_dotenv()
+try:
+    load_dotenv()
+except Exception as e:
+    printf("Exception {e}")
+    pass
 
 
 def get_secret(key):
