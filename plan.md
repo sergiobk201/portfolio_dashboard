@@ -23,9 +23,12 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - [X] Build "Trade History" (Recent Activity, P&L by position).
 - [X] Add sidebar filters for Date Range (Quarterly/Yearly) and Ticker.
 
-### [ ] Phase 3: Reporting & Polish
+### [X] Phase 3: Reporting & Polish
 - [X] Implement interactive Plotly charts for cumulative returns vs. benchmark (S&P 500).
 - [X] Style the app with custom CSS to match an institutional/professional look.
+- [X] Add advanced risk metrics: Annualized Volatility, Sharpe Ratio, and Sortino Ratio.
+- [X] Integrate 13-week T-bill yield (^IRX) as the risk-free rate proxy.
+- [X] Consolidate KPI tiles for cleaner benchmark comparison.
 
 ### [ ] Phase 4: Investor-Ready Dashboard (Public Mode)
 - [ ] Implement "Public Mode" toggle to mask all absolute BRL (R$) amounts.
