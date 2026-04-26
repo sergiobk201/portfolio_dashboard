@@ -35,7 +35,7 @@ Built with a focus on transparency and professional aesthetics, it serves as a c
 
 ## 📸 Live Portfolio 
 
-> 🔗 **Click here:** [Live Portfolio] (https://barkel-portfolio.streamlit.app) 
+> 🔗 **Click here:** (https://barkel-portfolio.streamlit.app) 
 
 ## 🏁 Quick Start
 
