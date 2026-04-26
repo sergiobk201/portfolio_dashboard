@@ -2,7 +2,7 @@ name: Daily SP500 Price Fetch
 
 on:
   schedule:
-    - cron: "0 15 * * *"
+    - cron: "0 15 * * 2-6"
   workflow_dispatch:
 
 env:
