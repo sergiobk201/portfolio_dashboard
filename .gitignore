@@ -14,6 +14,6 @@ attachments/
 
 # Or to ensure all instances in subdirectories are ignored:
 # **/.DS_Store
-*.png
+mockup.png
 
 app.py
