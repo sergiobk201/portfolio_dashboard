@@ -80,11 +80,20 @@ st.markdown(
 # Load environment variables for database connectivity
 load_dotenv()
 
-DB_HOST = os.environ.get("host")
-DB_PORT = os.environ.get("port")
-DB_NAME = os.environ.get("dbname")
-DB_USER = os.environ.get("user")
-DB_PASSWORD = os.environ.get("password")
+
+def get_secret(key):
+    # 1. Try Streamlit Cloud Secrets first
+    if key in st.secrets:
+        return st.secrets[key]
+    # 2. Fallback to local environment variables
+    return os.getenv(key)
+
+
+DB_HOST = get_secret("host")
+DB_PORT = get_secret("port")
+DB_NAME = get_secret("dbname")
+DB_USER = get_secret("user")
+DB_PASSWORD = get_secret("password")
 
 
 def _conn_params():
