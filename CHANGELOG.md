@@ -4,18 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 ### Added
-- `app.py`: Full Streamlit implementation with interactive dashboards.
+- `public_app.py`: Full Streamlit implementation with interactive dashboards.
+- **Advanced Quant Metrics:**
+  - Annualized Volatility calculation for portfolio returns.
+  - **Sharpe Ratio:** Textbook implementation using daily excess returns over risk-free rate.
+  - **Sortino Ratio:** Downside deviation calculation using risk-free rate as the Minimal Acceptable Return (MAR).
+- **Risk-Free Rate Engine:** Integration with `yfinance` to fetch 13-week US T-bill yields (^IRX) with auto-alignment and interpolation.
 - **Supabase Integration:** Vectorized data fetching for `portfolio_performance`, `prices`, `trades`, and `dividends`.
-- **KPI Engine:** Dynamic calculation of Total Value, Daily Return %, Daily Nominal Change, and YTD TWR.
-- **Visualizations:**
-  - **Portfolio vs. SPY:** Re-based performance chart using Plotly.
-  - **Sector Allocation:** Donut chart using asset metadata.
-  - **Segment Scorecard:** Comparative table for portfolio sub-segments.
-- **Filtering System:** Multi-select for portfolios/tickers and date range controls.
-- **Custom CSS:** Dark-themed institutional layout with KPI card styling.
-- `plan.md`: Added Phase 4 for Investor-Ready Dashboard (Public Mode).
 
 ### Changed
+- **KPI Layout:** Consolidated "vs SPY" comparison into the primary YTD Return tile.
+- **Stats Card:** Replaced redundant YTD comparison with a dedicated "Portfolio Stats" card for Vol/Sharpe/Sortino.
 - Refined TWR logic to handle both decimal factor and percentage formats from database sources.
 - Implemented robust error handling for external benchmark (SPY) data fetching via `yfinance`.
 - Optimized database connections using `@st.cache_resource` for singleton pooling.
