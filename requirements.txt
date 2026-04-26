@@ -1,3 +1,10 @@
 google-api-python-client==2.90.0
 google-auth-httplib2==0.1.0
 google-auth-oauthlib==1.0.0
+streamlit 
+pandas
+numpy 
+plotly
+psycopg2-binary
+python-dotenv
+yfinance
