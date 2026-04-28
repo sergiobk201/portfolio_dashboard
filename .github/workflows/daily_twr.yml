@@ -22,7 +22,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r prices_requirements.txt
+        run: pip install -r requirements/prices_requirements.txt
 
       - name: Run pipeline
         env:
@@ -33,4 +33,4 @@ jobs:
           port: ${{ secrets.DB_PORT }}
           PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
           PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
-        run: python calculate_daily_twr.py
+        run: python pipelines/calculate_daily_twr.py

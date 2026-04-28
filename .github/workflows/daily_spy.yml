@@ -22,7 +22,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r prices_requirements.txt
+        run: pip install -r requirements/prices_requirements.txt
 
       - name: Run pipeline
         env:
@@ -35,4 +35,4 @@ jobs:
           PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
           PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-        run: python spy_pipeline.py
+        run: python pipelines/spy_pipeline.py
