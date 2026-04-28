@@ -22,7 +22,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r prices_requirements.txt
+        run: pip install -r requirements/prices_requirements.txt
 
       - name: Run pipeline
         env:
@@ -34,4 +34,4 @@ jobs:
           BRAPI_KEY: ${{ secrets.BRAPI_KEY }}
           PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
           PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
-        run: python prices_pipeline.py
+        run: python pipelines/prices_pipeline.py
