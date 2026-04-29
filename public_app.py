@@ -1,6 +1,5 @@
 import os
 from datetime import date, datetime, timedelta
-from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -76,13 +75,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-# Load environment variables for database connectivity
-try:
-    load_dotenv()
-except Exception as e:
-    printf("Exception {e}")
-    pass
 
 
 def get_secret(key):
