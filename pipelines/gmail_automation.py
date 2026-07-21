@@ -21,8 +21,13 @@ from typing import Set
 from io import StringIO
 from dotenv import load_dotenv
 import yfinance as yf
+from google.auth.exceptions import RefreshError
 
-load_dotenv()
+# --- Path resolution
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 pdf_password = os.getenv("PASSWORD_PDF")
 UNRESOLVED_PLACEHOLDER = "!!!_INPUT_REQUIRED_!!!"
 
@@ -76,22 +81,47 @@ class GmailRicoImporter:
         SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
         creds = None
 
+        token_path = SCRIPT_DIR / "token.json"
+        credentials_path = SCRIPT_DIR / "credentials.json"
+
+        # Check project root if credentials.json is not in pipelines/
+        if not credentials_path.exists():
+            root_credentials = PROJECT_ROOT / "credentials.json"
+            if root_credentials.exists():
+                credentials_path = root_credentials
+
         # The file token.json stores the user's access and refresh tokens, and is
         # created automatically when the authorization flow completes for the first
         # time.
-        if os.path.exists("token.json"):
-            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if token_path.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            except Exception as e:
+                print(f"Error loading token.json: {e}")
+                creds = None
+
         # If there are no (valid) credentials available, let the user log in.
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    print(f"Refresh token expired or invalid, forcing re-authentication: {e}")
+                    creds = None  # Force re-authentication flow
+
+            if not creds:
+                if not credentials_path.exists():
+                    raise FileNotFoundError(
+                        f"Google OAuth client secrets file 'credentials.json' not found at {credentials_path}.\n"
+                        f"Please download it from the Google Cloud Console (OAuth 2.0 Client IDs -> Desktop client) "
+                        f"and save it to that location to authenticate."
+                    )
                 flow = InstalledAppFlow.from_client_secrets_file(
-                    "credentials.json", SCOPES
+                    str(credentials_path), SCOPES
                 )
                 creds = flow.run_local_server(port=0)
-                # Save the credentials for the next run
-            with open("token.json", "w") as token:
+
+            with open(token_path, "w") as token:
                 token.write(creds.to_json())
 
         try:
@@ -163,8 +193,9 @@ class GmailRicoImporter:
                     filename = f"trade_confirmation_{today}.pdf"
 
                     # Guardar el archivo localmente
-                    os.makedirs("attachments", exist_ok=True)
-                    path = os.path.join("attachments", filename)
+                    attachments_dir = PROJECT_ROOT / "attachments"
+                    attachments_dir.mkdir(parents=True, exist_ok=True)
+                    path = attachments_dir / filename
 
                     with open(path, "wb") as f:
                         f.write(file_data)
@@ -177,8 +208,8 @@ class GmailRicoImporter:
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         self.today = today
 
-        attachments_dir = os.path.join(os.getcwd(), "attachments/trade_confirmation")
-        pdf_path = f"{attachments_dir}_{today}.pdf"
+        attachments_dir = PROJECT_ROOT / "attachments"
+        pdf_path = str(attachments_dir / f"trade_confirmation_{today}.pdf")
 
         self.pdf_path = pdf_path
 
@@ -190,25 +221,21 @@ class GmailRicoImporter:
     def final_pdf(self):
 
         input_pdf = self.pdf_path
-        output_pdf = f"statement_unlocked_{self.today}.pdf"
-        self.output_pdf = output_pdf
+        attachments_dir = PROJECT_ROOT / "attachments"
+        output_pdf_name = f"statement_unlocked_{self.today}.pdf"
+        output_pdf_path = attachments_dir / output_pdf_name
 
-        self.decrypt_pdf(input_pdf, output_pdf, pdf_password)
-        print("Decrypted PDF saved:", output_pdf)
+        self.output_pdf = output_pdf_name
+        self.dst = str(attachments_dir)
+
+        self.decrypt_pdf(input_pdf, str(output_pdf_path), pdf_password)
+        print("Decrypted PDF saved:", output_pdf_path)
 
         try:
             os.remove(self.pdf_path)
             print(f"Removed encrypted PDF: {self.pdf_path}")
         except Exception as e:
             print(f"Error removing file {self.pdf_path}: {e}")
-
-        src = os.path.join(os.getcwd(), output_pdf)
-        dst = os.path.join(os.getcwd(), "attachments")
-
-        self.dst = dst
-
-        shutil.move(src, dst)
-        print(f"Moved decrypted PDF to: {dst}")
 
     def read_pdf(self):
 
