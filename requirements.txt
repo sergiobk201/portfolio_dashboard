@@ -1,10 +1,10 @@
-google-api-python-client==2.90.0
-google-auth-httplib2==0.1.0
-google-auth-oauthlib==1.0.0
-streamlit 
-pandas
-numpy 
-plotly
-psycopg2-binary
-python-dotenv
-yfinance
+# Public dashboard (public_app.py). Streamlit Community Cloud installs this file.
+# Supports Python 3.10-3.13; shared pins must match prices_requirements.txt.
+numpy==2.2.6
+pandas==2.3.3
+plotly==7.1.0
+psycopg2-binary==2.9.13
+python-dotenv==1.2.4
+requests==2.34.2
+streamlit==1.65.0
+yfinance==1.8.0
