@@ -17,3 +17,8 @@ attachments/
 mockup.png
 
 app.py
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/

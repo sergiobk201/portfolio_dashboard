@@ -1,0 +1,111 @@
+name: Daily pipeline
+
+# B3 publishes the official session file (COTAHIST) around 20:55 BRT. Every job
+# targets the last session completed before "today" in its exchange's own
+# timezone, so a late, repeated or manual start computes the same thing.
+# The second schedule is an idempotent retry: a no-op when the first run
+# already filled everything.
+on:
+  schedule:
+    - cron: "30 10 * * *" # 07:30 BRT
+    - cron: "30 16 * * *" # 13:30 BRT (retry)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false # never kill a run mid-transaction; queue instead
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  verify:
+    name: Tests (gate for every write)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            prices_requirements.txt
+            requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest
+
+  market-data:
+    name: Prices + benchmark
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      host: ${{ secrets.DB_HOST }}
+      dbname: ${{ secrets.DB_NAME }}
+      user: ${{ secrets.DB_USER }}
+      password: ${{ secrets.DB_PASSWORD }}
+      port: ${{ secrets.DB_PORT }}
+      PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
+      PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: prices_requirements.txt
+      - run: pip install -r prices_requirements.txt
+      - name: B3 closes (official COTAHIST → Yahoo raw → BRAPI)
+        env:
+          BRAPI_KEY: ${{ secrets.BRAPI_KEY }}
+        run: python pipelines/prices_pipeline.py
+      - name: SPY benchmark (FMP → Yahoo raw)
+        if: ${{ !cancelled() }}
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python pipelines/spy_pipeline.py
+
+  performance:
+    name: Portfolio performance (full recompute)
+    needs: [verify, market-data]
+    # Runs even when a price step failed: the engine truncates at the first
+    # unloaded session and blocks every write on an unpriced holding.
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      host: ${{ secrets.DB_HOST }}
+      dbname: ${{ secrets.DB_NAME }}
+      user: ${{ secrets.DB_USER }}
+      password: ${{ secrets.DB_PASSWORD }}
+      port: ${{ secrets.DB_PORT }}
+      PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
+      PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: prices_requirements.txt
+      - run: pip install -r prices_requirements.txt
+      - run: python pipelines/calculate_daily_twr.py
+
+  keepalive:
+    # GitHub disables schedules in public repos after 60 days without
+    # repository activity; re-enabling through the API resets that clock.
+    name: Keep the schedule enabled
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable daily_pipeline.yml --repo "$GITHUB_REPOSITORY"
