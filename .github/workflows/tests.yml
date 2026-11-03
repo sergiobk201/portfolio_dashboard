@@ -29,5 +29,10 @@ jobs:
           cache-dependency-path: |
             prices_requirements.txt
             requirements-dev.txt
-      - run: pip install -r requirements-dev.txt
+            requirements.txt
+      # Pipeline + dashboard stacks: the AppTest smoke tests need Streamlit
+      # (the daily gate installs only the pipeline stack and skips them).
+      - run: pip install -r requirements-dev.txt -r requirements.txt
+      # Syntax gate for code the tests do not import (the Streamlit app, tools/).
+      - run: python -m compileall -q pipelines tools public_app.py
       - run: python -m pytest
