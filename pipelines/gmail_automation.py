@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 import yfinance as yf
 from google.auth.exceptions import RefreshError
 
+from nota_fees import cblc_fees, extract_dc_flag
+
 # --- Path resolution
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -294,10 +296,12 @@ class GmailRicoImporter:
         match = re.search(pattern, text)
         return match.group(1) if match else None
 
+
     def extract_fees(self):
 
         total_cblc = self.extract_single_value("Total CBLC", self.full_text)
-        print("Total CBLC:", total_cblc)
+        self.cblc_flag = extract_dc_flag("Total CBLC", self.full_text)
+        print("Total CBLC:", total_cblc, self.cblc_flag or "(no D/C flag)")
 
         total_bovespa = self.extract_single_value(
             "Total Bovespa / Soma", self.full_text
@@ -330,13 +334,14 @@ class GmailRicoImporter:
         self.trade_date = trade_date
 
         total_trade_volume = self.df["total"].sum()
-        total_fees = (
-            self.total_cblc
-            - total_trade_volume
-            + self.total_custos
-            + self.total_bovespa
-        ).round(2)
+        buys = float(self.df.loc[self.df["side"] == "C", "total"].sum())
+        sells = float(self.df.loc[self.df["side"] == "V", "total"].sum())
+        total_fees = round(
+            cblc_fees(self.total_cblc, self.cblc_flag, buys, sells) + self.total_custos + self.total_bovespa,
+            2,
+        )
 
+        # Pro-rata by trade value: each trade carries its share of the note's costs.
         self.df["fee"] = round(self.df["total"] / total_trade_volume * total_fees, 2)
         self.df["ticker"] = None
 
