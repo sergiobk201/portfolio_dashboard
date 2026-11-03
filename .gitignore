@@ -1,13 +1,19 @@
 # Configuration and Credential Files
 .env
+.streamlit/secrets.toml
 credentials.json
 token.json
 
 # Directories
 attachments/
 
-#Statements
+# Broker documents and data exports hold personal data: never commit them.
+# (A decrypted statement PDF and ledger CSV/notebooks once reached history.)
 *.xlsx
+*.pdf
+*.csv
+!tests/**/*.csv
+*.ipynb
 
 # Ignore Mac OS X system files
 .DS_Store
@@ -22,3 +28,4 @@ app.py
 __pycache__/
 .pytest_cache/
 .venv/
+.repair/
