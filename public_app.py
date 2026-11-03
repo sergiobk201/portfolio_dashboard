@@ -1,12 +1,59 @@
+"""
+public_app.py
+─────────────
+Public Streamlit dashboard: performance, allocation and income of the
+portfolio. Percentages only — nominal values are never sent to the browser.
+
+Every number comes from pipelines/dashboard_metrics.py (unit-tested); this
+file only loads data and renders it. Holdings use the same engine as the TWR
+pipeline, so splits and bonus issues are applied identically everywhere.
+
+Secrets: Streamlit Cloud ``st.secrets`` first, then environment / ``.env``
+(keys: host, port, dbname, user, password).
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-from datetime import date, datetime, timedelta
-import numpy as np
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
-import psycopg2.extras
+import psycopg2.extensions
+import requests
 import streamlit as st
+import yfinance as yf
+from dotenv import load_dotenv
+
+try:  # yfinance ≥ 0.2.50 exposes a typed exception hierarchy
+    from yfinance.exceptions import YFException
+except ImportError:  # pragma: no cover - older yfinance
+    YFException = RuntimeError  # type: ignore[misc,assignment]
+
+ROOT = Path(__file__).resolve().parent
+PIPELINES = str(ROOT / "pipelines")
+if PIPELINES not in sys.path:  # Streamlit re-executes this file on every rerun
+    sys.path.append(PIPELINES)
+import dashboard_metrics as dm  # noqa: E402
+
+load_dotenv(ROOT / ".env")  # local runs only; Streamlit Cloud uses st.secrets
+log = logging.getLogger("public_app")
+
+SGS_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
+SGS_CDI, SGS_PTAX = 12, 1  # CDI (% per business day); USD/BRL PTAX sell rate
+SGS_MAX_SPAN = timedelta(days=3650)  # BCB caps daily-series queries at 10 years
+HTTP_TIMEOUT_S = 15
+# requests and curl_cffi (yfinance) network errors both subclass OSError.
+FETCH_ERRORS = (OSError, ValueError, KeyError, TypeError, YFException)
+
+SURFACE, GRID, TEXT, MUTED = "#1a1d24", "#2a2e38", "#e5e7eb", "#a0a4ab"
+# Dark categorical steps, validated on SURFACE (CVD-safe in this order).
+PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+PORTFOLIO_COLOR, SPY_COLOR, CDI_COLOR = PALETTE[0], PALETTE[1], MUTED  # CDI = neutral reference
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIGURATION
@@ -77,353 +124,210 @@ st.markdown(
 )
 
 
-def get_secret(key):
-    # 1. Try Streamlit Cloud Secrets first
-    if key in st.secrets:
-        return st.secrets[key]
-    # 2. Fallback to local environment variables
+# ─────────────────────────────────────────────────────────────
+# DATABASE ACCESS (read-only)
+# ─────────────────────────────────────────────────────────────
+def get_secret(key: str) -> str | None:
+    """Streamlit Cloud secret, else environment variable (None if neither)."""
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except FileNotFoundError:  # no secrets.toml; StreamlitSecretNotFoundError subclasses it
+        pass
     return os.getenv(key)
 
 
-DB_HOST = get_secret("host")
-DB_PORT = get_secret("port")
-DB_NAME = get_secret("dbname")
-DB_USER = get_secret("user")
-DB_PASSWORD = get_secret("password")
+@st.cache_resource(show_spinner=False)
+def get_conn() -> psycopg2.extensions.connection:
+    """One read-only connection per app process."""
+    conn = psycopg2.connect(
+        host=get_secret("host"),
+        port=get_secret("port"),
+        dbname=get_secret("dbname"),
+        user=get_secret("user"),
+        password=get_secret("password"),
+        sslmode=get_secret("DB_SSLMODE") or "require",  # same override as pipelines/db.py
+        connect_timeout=10,
+    )
+    # Emitted as BEGIN READ ONLY per transaction (not a session SET), so it is
+    # safe behind a transaction pooler: the public app can never write.
+    conn.set_session(readonly=True)
+    return conn
 
 
-def _conn_params():
-    # Helper to consolidate connection parameters
-    return {
-        "host": DB_HOST,
-        "port": DB_PORT,
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-        "sslmode": "require",
-    }
+def _fetch(conn: psycopg2.extensions.connection, sql: str, params: tuple) -> pd.DataFrame:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            columns = [d.name for d in cur.description]
+            rows = cur.fetchall()
+    finally:
+        if not conn.closed:
+            conn.rollback()  # end the read-only transaction; never idle in transaction
+    return pd.DataFrame(rows, columns=columns)
 
 
-@st.cache_resource
-def get_conn():
-    # Maintains a singleton database connection to optimize resource usage
-    return psycopg2.connect(**_conn_params())
-
-
-def run_query(sql: str, params=None) -> pd.DataFrame:
-    # Executing SQL query and returning results as a pandas DataFrame for vectorized processing
+def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    """SELECT → DataFrame (columns kept when empty); one reconnect if the pooler dropped us."""
     conn = get_conn()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or ())
-            rows = cur.fetchall()
-    except Exception:
-        conn.rollback()
-        raise
-    return pd.DataFrame([dict(r) for r in rows])
+        return _fetch(conn, sql, params)
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        conn.close()  # no-op when already closed
+        get_conn.clear()
+        return _fetch(get_conn(), sql, params)
 
 
-# ─────────────────────────────────────────────────────────────
-# DATA LOADERS (Cached to improve performance)
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def load_portfolio_performance() -> pd.DataFrame:
-    # Loads historical daily performance metrics (TWR, daily returns, total values)
-    df = run_query("SELECT * FROM portfolio_performance ORDER BY date")
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    for c in [
-        "portfolio_value",
-        "equity_value",
-        "uninvested_cash",
-        "total_invested",
-        "external_inflow",
-        "daily_return",
-        "twr",
-    ]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+def _typed(df: pd.DataFrame, dates: tuple[str, ...] = (), numbers: tuple[str, ...] = ()) -> pd.DataFrame:
+    for col in dates:
+        df[col] = pd.to_datetime(df[col])
+    for col in numbers:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
     return df
 
 
-@st.cache_data(ttl=300)
+# ─────────────────────────────────────────────────────────────
+# DATA LOADERS (cached)
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def load_performance() -> pd.DataFrame:
+    """Returns only — the public app never reads nominal portfolio values."""
+    sql = "SELECT date, daily_return, twr, is_trading_day FROM portfolio_performance ORDER BY date"
+    return _typed(run_query(sql), ("date",), ("daily_return", "twr"))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_prices() -> pd.DataFrame:
-    # Loads historical closing prices for all tickers in the universe
-    df = run_query("SELECT date, ticker, price FROM prices ORDER BY date")
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    return df
+    """Raw closes (no-trade markers carry the last close, corporate-action adjusted)."""
+    sql = "SELECT date, ticker, price FROM prices ORDER BY ticker, date"
+    return _typed(run_query(sql), ("date",), ("price",))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_trades() -> pd.DataFrame:
-    # Loads full trade history ledger
-    df = run_query("SELECT * FROM trades ORDER BY date")
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    for c in ["quantity", "price", "total", "fee"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    sql = "SELECT date, side, ticker, quantity, price, total, fee, portfolio FROM trades ORDER BY date"
+    return _typed(run_query(sql), ("date",), ("quantity", "price", "total", "fee"))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_dividends() -> pd.DataFrame:
-    # Loads all received dividend payments
-    df = run_query("SELECT * FROM dividends ORDER BY dividend_date")
-    if df.empty:
-        return df
-    df["dividend_date"] = pd.to_datetime(df["dividend_date"])
-    for c in ["dividend", "total", "quantity"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    sql = (
+        "SELECT dividend_date, ticker, type, dividend, total, quantity, portfolio "
+        "FROM dividends ORDER BY dividend_date"
+    )
+    return _typed(run_query(sql), ("dividend_date",), ("dividend", "total", "quantity"))
 
 
-@st.cache_data(ttl=3600)
-def load_assets() -> pd.DataFrame:
-    # Loads asset metadata like sector classifications
-    return run_query("SELECT * FROM assets")
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_spy(start: date, end: date) -> pd.DataFrame:
-    # Fetches external benchmark (SPY) data from database for performance comparison
-    try:
-        query = """
-            SELECT date, price as spy_price 
-            FROM benchmark 
-            WHERE date >= %s AND date <= %s 
-            ORDER BY date
-        """
-        spy = run_query(query, (start, end))
-        if spy.empty:
-            return pd.DataFrame(columns=["date", "spy_price"])
-        spy["date"] = pd.to_datetime(spy["date"])
-        spy["spy_price"] = pd.to_numeric(spy["spy_price"], errors="coerce")
-        return spy
-    except Exception as e:
-        st.warning(f"Benchmark fetch failed ({e}); benchmark hidden.")
-        return pd.DataFrame(columns=["date", "spy_price"])
+@st.cache_data(ttl=300, show_spinner=False)
+def load_corporate_actions() -> pd.DataFrame:
+    sql = "SELECT ticker, ex_date, ratio FROM corporate_actions ORDER BY ex_date"
+    return _typed(run_query(sql), ("ex_date",), ("ratio",))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_risk_free_rate(start: date, end: date) -> pd.DataFrame:
-    """Fetches 13-week US T-bill yield (^IRX) as risk-free rate proxy.
+def load_assets() -> pd.DataFrame:
+    return run_query("SELECT ticker, sector FROM assets")
 
-    ^IRX is quoted by Yahoo as an annualized percentage (e.g. 4.52 = 4.52%).
-    Returns DataFrame with [date, rf_annual] where rf_annual is decimal form.
-    """
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_benchmark() -> pd.Series:
+    """Raw SPY closes (USD) per NYSE session."""
+    df = _typed(run_query("SELECT date, price FROM benchmark ORDER BY date"), ("date",), ("price",))
+    return pd.Series(df["price"].to_numpy(dtype=float), index=pd.DatetimeIndex(df["date"])).dropna()
+
+
+# ─────────────────────────────────────────────────────────────
+# REFERENCE DATA (BCB, Yahoo) — successes cached for hours, failures for 10 min
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _sgs(code: int, start: date, end: date) -> pd.Series:
+    start = max(start, end - SGS_MAX_SPAN)
+    resp = requests.get(
+        SGS_URL.format(code=code),
+        params={"formato": "json", "dataInicial": f"{start:%d/%m/%Y}", "dataFinal": f"{end:%d/%m/%Y}"},
+        timeout=HTTP_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return dm.parse_sgs(resp.json())
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_sgs(code: int, start: date, end: date) -> pd.Series:
+    """BCB SGS series; empty on failure (logged, shown as a fallback label)."""
     try:
-        import yfinance as yf
-
-        rf = yf.download(
-            "^IRX",
-            start=start,
-            end=end + timedelta(days=1),
-            progress=False,
-            auto_adjust=False,
-        )
-        if rf.empty:
-            return pd.DataFrame(columns=["date", "rf_annual"])
-        # Newer yfinance versions return MultiIndex columns
-        if isinstance(rf.columns, pd.MultiIndex):
-            rf.columns = rf.columns.get_level_values(0)
-        rf = rf[["Close"]].reset_index()
-        rf.columns = ["date", "rf_annual"]
-        rf["date"] = pd.to_datetime(rf["date"])
-        rf["rf_annual"] = pd.to_numeric(rf["rf_annual"], errors="coerce") / 100.0
-        return rf.dropna()
-    except Exception as e:
-        st.warning(f"Risk-free rate fetch failed ({e}); defaulting to 0%.")
-        return pd.DataFrame(columns=["date", "rf_annual"])
+        return _sgs(code, start, end)
+    except FETCH_ERRORS as exc:
+        log.warning("BCB SGS %s unavailable: %r", code, exc)
+        return dm.empty_series()
 
 
-# ─────────────────────────────────────────────────────────────
-# CORE FINANCIAL CALCULATIONS
-# ─────────────────────────────────────────────────────────────
-def current_holdings(
-    trades_df: pd.DataFrame,
-    prices_df: pd.DataFrame,
-    portfolio_filter=None,
-    ticker_filter=None,
-) -> pd.DataFrame:
-    """Calculates net holdings per ticker by aggregating trade history and joining with latest prices."""
-    if trades_df.empty:
-        return pd.DataFrame(columns=["ticker", "quantity", "price", "value"])
-
-    t = trades_df.copy()
-    if portfolio_filter:
-        t = t[t["portfolio"].isin(portfolio_filter)]
-    if ticker_filter:
-        t = t[t["ticker"].isin(ticker_filter)]
-    if t.empty:
-        return pd.DataFrame(columns=["ticker", "quantity", "price", "value"])
-
-    # Calculate net signed quantity based on trade side (BUY vs SELL)
-    t["qty_signed"] = t.apply(
-        lambda r: (
-            r["quantity"]
-            if str(r["side"]).strip().upper() in ("BUY", "B", "COMPRA")
-            else -r["quantity"]
-        ),
-        axis=1,
-    )
-    h = t.groupby("ticker", as_index=False)["qty_signed"].sum()
-    h.columns = ["ticker", "quantity"]
-    h = h[h["quantity"] > 0]
-
-    if h.empty or prices_df.empty:
-        h["price"] = np.nan
-        h["value"] = np.nan
-        return h
-
-    # Join with the latest price per ticker from the pricing table
-    last = (
-        prices_df.sort_values("date")
-        .groupby("ticker", as_index=False)
-        .tail(1)[["ticker", "price"]]
-    )
-    h = h.merge(last, on="ticker", how="left")
-    h["value"] = h["quantity"] * h["price"]
-    return h
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _spy_dividends() -> pd.Series:
+    raw = yf.Ticker("SPY").dividends
+    if raw is None or raw.empty:
+        raise ValueError("Yahoo returned no SPY dividends")
+    idx = pd.DatetimeIndex(raw.index)
+    idx = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()  # ex-dates
+    return pd.Series(raw.to_numpy(dtype=float), index=idx)
 
 
-def ytd_price_change_pct(prices_df: pd.DataFrame, ticker: str) -> float:
-    # Calculates the price percentage change from Jan 1st of the current year
-    if prices_df.empty:
-        return np.nan
-    p = prices_df[prices_df["ticker"] == ticker].sort_values("date")
-    if p.empty:
-        return np.nan
-    ystart = pd.Timestamp(date(datetime.now().year, 1, 1))
-    p_ytd = p[p["date"] >= ystart]
-    # Fallback to the first available price if the asset was acquired after Jan 1st
-    start_px = p_ytd.iloc[0]["price"] if not p_ytd.empty else p.iloc[0]["price"]
-    end_px = p.iloc[-1]["price"]
-    if not start_px or pd.isna(start_px):
-        return np.nan
-    return (end_px - start_px) / start_px * 100.0
-
-
-def top_ytd_ticker_performer(prices_df, ticker_filter=None):
-    # Identifies the ticker with the highest YTD price performance
-    if prices_df.empty:
-        return None, 0.0
-    tickers = prices_df["ticker"].unique()
-    if ticker_filter:
-        tickers = [t for t in tickers if t in ticker_filter]
-
-    results = []
-    for t in tickers:
-        chg = ytd_price_change_pct(prices_df, t)
-        if not pd.isna(chg):
-            results.append((t, chg))
-
-    if not results:
-        return None, 0.0
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results[0][0], float(results[0][1])
-
-
-def top_portfolio_performer(trades_df, prices_df, ticker_filter=None):
-    # Identifies the portfolio segment with the highest weighted YTD performance
-    if trades_df.empty:
-        return None, 0.0
-    pfs = trades_df["portfolio"].dropna().unique()
-    results = []
-    for pf in pfs:
-        h = current_holdings(trades_df, prices_df, [pf], ticker_filter)
-        if h.empty or not h["value"].sum():
-            continue
-        h = h.copy()
-        h["ytd"] = (
-            h["ticker"].apply(lambda tk: ytd_price_change_pct(prices_df, tk)).fillna(0)
-        )
-        val = h["value"].sum()
-        w = (h["value"] * h["ytd"]).sum() / val if val else 0
-        results.append((pf, w))
-    if not results:
-        return None, 0.0
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results[0][0], float(results[0][1])
-
-
-def segment_performance(
-    trades_df, prices_df, dividends_df, ticker_filter=None
-) -> pd.DataFrame:
-    # Calculates a YTD scorecard (Price Return, Dividend Yield, Allocation) per portfolio segment
-    cols = ["Portfolio", "YTD Change", "DY %", "Weight %"]
-    if trades_df.empty:
-        return pd.DataFrame(columns=cols)
-    pfs = trades_df["portfolio"].dropna().unique()
-    all_h = current_holdings(trades_df, prices_df, ticker_filter=ticker_filter)
-    grand = all_h["value"].sum() if not all_h.empty else 0.0
-
-    rows = []
-    ystart = pd.Timestamp(date(datetime.now().year, 1, 1))
-    for pf in pfs:
-        h = current_holdings(trades_df, prices_df, [pf], ticker_filter)
-        if h.empty:
-            continue
-        val = h["value"].sum()
-        h = h.copy()
-        h["ytd"] = (
-            h["ticker"].apply(lambda tk: ytd_price_change_pct(prices_df, tk)).fillna(0)
-        )
-        twr = (h["value"] * h["ytd"]).sum() / val if val else 0
-
-        dy = 0.0
-        if not dividends_df.empty:
-            d = dividends_df[dividends_df["portfolio"] == pf]
-            d = d[d["dividend_date"] >= ystart]
-            if ticker_filter:
-                d = d[d["ticker"].isin(ticker_filter)]
-            if not d.empty and val:
-                dy = d["total"].sum() / val * 100
-        weight = (val / grand * 100) if grand else 0
-        rows.append(
-            {
-                "Portfolio": pf,
-                "YTD Change": twr,
-                "DY %": dy,
-                "Weight %": weight,
-            }
-        )
-    return pd.DataFrame(rows, columns=cols)
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_spy_dividends() -> pd.Series:
+    """SPY cash dividends by ex-date; empty on failure (benchmark falls back to price)."""
+    try:
+        return _spy_dividends()
+    except FETCH_ERRORS as exc:
+        log.warning("SPY dividends unavailable: %r", exc)
+        return dm.empty_series()
 
 
 # ─────────────────────────────────────────────────────────────
 # DATABASE LOAD SEQUENCE
 # ─────────────────────────────────────────────────────────────
 try:
-    perf = load_portfolio_performance()
+    perf = load_performance()
     prices = load_prices()
     trades = load_trades()
     dividends = load_dividends()
+    actions = load_corporate_actions()
     assets = load_assets()
-except Exception as e:
-    st.error(f"❌ Database connection failed: {e}")
-    st.info("Ensure database environment variables are correctly set.")
+    spy_close = load_benchmark()
+except psycopg2.Error as exc:
+    log.exception("database load failed")
+    st.error("❌ Portfolio database unavailable — please retry in a minute.")
+    st.caption(type(exc).__name__)
     st.stop()
 
-latest_date = (
-    perf["date"].max()
-    if not perf.empty
-    else (prices["date"].max() if not prices.empty else pd.Timestamp.today())
-)
+if perf.empty:
+    st.info("No performance history yet — the daily pipeline has not produced data.")
+    st.stop()
+
+latest = perf["date"].max()
+ystart = pd.Timestamp(latest.year, 1, 1)  # YTD of the data, not of the server clock
+first_needed = min(perf["date"].min(), spy_close.index.min()) if not spy_close.empty else perf["date"].min()
+ref_start, ref_end = (first_needed - pd.Timedelta(days=10)).date(), latest.date()
+
+
+def upto(series: pd.Series) -> pd.Series:
+    """Clip a level series at the latest portfolio date (apples-to-apples)."""
+    return series[series.index <= latest]
+
+
+# Portfolio, benchmark and risk-free levels (growth of 1).
+twr_level = pd.Series(1.0 + perf["twr"].to_numpy(dtype=float), index=pd.DatetimeIndex(perf["date"]))
+cdi_level = upto(dm.accrual_index(fetch_sgs(SGS_CDI, ref_start, ref_end)))
+ptax = fetch_sgs(SGS_PTAX, ref_start, ref_end)
+spy_divs = fetch_spy_dividends()
+spy_usd = dm.total_return_index(spy_close, spy_divs) if not spy_close.empty else dm.empty_series()
+spy_level = upto(dm.to_brl(spy_usd, ptax) if not ptax.empty else spy_usd)
+spy_label = f"SPY {'TR' if not spy_divs.empty else 'price'} ({'BRL' if not ptax.empty else 'USD'})"
 
 # ─────────────────────────────────────────────────────────────
 # DASHBOARD HEADER
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h1 class='dash-title'>SERGIO'S PORTFOLIO</h1>", unsafe_allow_html=True)
 st.markdown(
-    f"<div class='dash-caption'>Last updated: <b>{latest_date.strftime('%Y-%m-%d')}</b> "
+    f"<div class='dash-caption'>Last updated: <b>{latest:%Y-%m-%d}</b> "
     f"&nbsp;|&nbsp; Reporting: <b>Net Performance & Allocation</b></div>",
     unsafe_allow_html=True,
 )
@@ -434,14 +338,8 @@ st.markdown(
 st.markdown("<div style='margin-top:15px;'></div>", unsafe_allow_html=True)
 fc1, fc2, fc_spacer = st.columns([2, 1, 2])
 with fc1:
-    all_tickers = (
-        sorted(trades["ticker"].dropna().unique().tolist()) if not trades.empty else []
-    )
-    all_pfs = (
-        sorted(trades["portfolio"].dropna().unique().tolist())
-        if not trades.empty
-        else []
-    )
+    all_tickers = sorted(trades["ticker"].dropna().unique().tolist())
+    all_pfs = sorted(trades["portfolio"].dropna().unique().tolist())
     options = [f"📁 {p}" for p in all_pfs] + [f"▪ {t}" for t in all_tickers]
     chosen = st.multiselect(
         "flt",
@@ -453,8 +351,8 @@ with fc1:
     sel_tks = [c[2:].strip() for c in chosen if c.startswith("▪")]
 
 with fc2:
-    d_start = (latest_date - timedelta(days=365)).date()
-    d_end = latest_date.date()
+    d_start = (latest - timedelta(days=365)).date()
+    d_end = latest.date()
     dr = st.date_input(
         "📅 RANGE",
         value=(d_start, d_end),
@@ -463,9 +361,9 @@ with fc2:
     )
 
 if isinstance(dr, tuple) and len(dr) == 2:
-    range_start, range_end = dr
-else:
-    range_start, range_end = d_start, d_end
+    range_start, range_end = pd.Timestamp(dr[0]), pd.Timestamp(dr[1])
+else:  # mid-selection: one date picked so far
+    range_start, range_end = pd.Timestamp(d_start), pd.Timestamp(d_end)
 
 port_f = sel_pfs or None
 tick_f = sel_tks or None
@@ -473,94 +371,36 @@ tick_f = sel_tks or None
 # ─────────────────────────────────────────────────────────────
 # KPI BLOCK CALCULATIONS
 # ─────────────────────────────────────────────────────────────
-vol_ann = sharpe = sortino = 0.0
-spy_ytd_pct = 0.0
+ytd_pct = dm.change_since(twr_level, ystart)
+spy_ytd_pct = dm.change_since(spy_level, ystart)
+cdi_ytd_pct = dm.change_since(cdi_level, ystart)
 
-if not perf.empty:
-    p_sorted = perf.sort_values("date")
-    latest_row = p_sorted.iloc[-1]
-    daily_ret_pct = float(latest_row.get("daily_return") or 0)
-    if abs(daily_ret_pct) < 1 and daily_ret_pct != 0:
-        daily_ret_pct *= 100
+sessions = dm.session_returns(perf)  # fill days folded into the preceding B3 session
+last_session = sessions.index[-1] if not sessions.empty else latest
+daily_ret_pct = float(sessions.iloc[-1]) * 100.0 if not sessions.empty else 0.0
+rf_per_session = dm.period_returns(cdi_level, sessions.index) if not cdi_level.empty else None
+stats = dm.risk_stats(sessions[sessions.index >= ystart], rf_per_session)
 
-    ystart = pd.Timestamp(date(datetime.now().year, 1, 1))
-    p_ytd_df = p_sorted[p_sorted["date"] >= ystart].copy()
-    if not p_ytd_df.empty:
-        rets = p_ytd_df["daily_return"].fillna(0).astype(float)
-        if rets.abs().max() > 1.0:
-            rets = rets / 100.0
-        ytd_pct = (np.prod(1 + rets) - 1) * 100
-        p_ytd_df["daily_return_normalized"] = rets
-    else:
-        ytd_pct = 0
+adjusted = dm.adjusted_prices(prices, actions)  # today's share basis
+ytd_by_ticker = dm.ytd_changes(adjusted, ystart)
+held = dm.holdings(trades, actions, adjusted, port_f, tick_f)
+scorecard = dm.segment_scorecard(trades, actions, adjusted, dividends, ystart, tick_f)
+
+held_ytd = ytd_by_ticker.reindex(held["ticker"]).dropna()
+top_tk, top_tk_pct = (held_ytd.idxmax(), float(held_ytd.max())) if not held_ytd.empty else (None, 0.0)
+if not scorecard.empty:
+    best = scorecard.loc[scorecard["YTD Change"].idxmax()]
+    top_pf_name, top_pf_pct = str(best["Portfolio"]), float(best["YTD Change"])
 else:
-    daily_ret_pct = ytd_pct = 0.0
-
-# Secondary KPI metrics for top-performers
-top_tk, top_tk_pct = top_ytd_ticker_performer(prices, tick_f)
-top_pf_name, top_pf_pct = top_portfolio_performer(trades, prices, tick_f)
-
-try:
-    ystart_date = date(datetime.now().year, 1, 1)
-    spy_ytd_df = fetch_spy(ystart_date, latest_date.date())
-    rf_ytd_df = fetch_risk_free_rate(ystart_date, latest_date.date())
-
-    if not spy_ytd_df.empty:
-        spy_ytd_df = spy_ytd_df.sort_values("date")
-        spy_ytd_pct = float(
-            (spy_ytd_df["spy_price"].iloc[-1] - spy_ytd_df["spy_price"].iloc[0])
-            / spy_ytd_df["spy_price"].iloc[0]
-            * 100
-        )
-        spy_ytd_df["spy_daily_ret"] = spy_ytd_df["spy_price"].pct_change().fillna(0)
-
-        if not p_ytd_df.empty:
-            # Align portfolio + benchmark series
-            combined = pd.merge(
-                p_ytd_df[["date", "daily_return_normalized"]],
-                spy_ytd_df[["date", "spy_daily_ret"]],
-                on="date",
-                how="inner",
-            )
-
-            # Attach risk-free rate; forward/back-fill since T-bills don't trade every day
-            if not rf_ytd_df.empty:
-                combined = combined.merge(rf_ytd_df, on="date", how="left")
-                combined["rf_annual"] = combined["rf_annual"].ffill().bfill().fillna(0)
-            else:
-                combined["rf_annual"] = 0.0
-
-            # Convert annualized rf to daily equivalent (geometric)
-            combined["rf_daily"] = (1 + combined["rf_annual"]) ** (1 / 252) - 1
-
-            if not combined.empty and len(combined) > 1:
-                p_r = combined["daily_return_normalized"]
-                rf_d = combined["rf_daily"]
-                excess = p_r - rf_d  # daily excess return over risk-free
-
-                # Portfolio volatility (annualized) — kept for the KPI card
-                vol_ann = p_r.std() * np.sqrt(252) * 100
-
-                # ── Sharpe Ratio (textbook, annualized) ────────────────────
-                # = mean(excess_daily) * 252  /  (std(excess_daily) * sqrt(252))
-                ann_excess_ret = excess.mean() * 252
-                ann_excess_vol = excess.std() * np.sqrt(252)
-                sharpe = ann_excess_ret / ann_excess_vol if ann_excess_vol > 0 else 0
-
-                # ── Sortino Ratio (textbook, annualized) ───────────────────
-                # MAR = risk-free rate (excess already subtracts rf, so MAR = 0 here).
-                # Downside dev uses ALL N obs (standard), not just negative ones.
-                downside_dev_daily = np.sqrt(np.mean(np.minimum(0, excess) ** 2))
-                downside_dev_ann = downside_dev_daily * np.sqrt(252)
-                sortino = (
-                    ann_excess_ret / downside_dev_ann if downside_dev_ann > 0 else 0
-                )
-except Exception:
-    pass
+    top_pf_name, top_pf_pct = None, 0.0
 
 
-def arrow_cls(x: float):
+def arrow_cls(x: float) -> tuple[str, str]:
     return ("▲", "up") if x >= 0 else ("▼", "down")
+
+
+def pct(x: float, digits: int = 1) -> str:
+    return "—" if pd.isna(x) else f"{x:+.{digits}f}%"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -574,8 +414,8 @@ with k1:
         f"""
         <div class='card'>
             <div class='card-title'>Portfolio Return (YTD)</div>
-            <div class='kpi-value {c_y}'>{ytd_pct:+.1f}%</div>
-            <div class='kpi-sub'>vs. {spy_ytd_pct:+.1f}% SPY</div>
+            <div class='kpi-value {c_y}'>{pct(ytd_pct)}</div>
+            <div class='kpi-sub'>vs. {pct(spy_ytd_pct)} {spy_label} · {pct(cdi_ytd_pct)} CDI</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -590,7 +430,7 @@ with k2:
             <div class='kpi-value {c_t}' style='margin-top:0.9rem;'>
                 {a_t} {daily_ret_pct:+.2f}%
             </div>
-            <div class='kpi-sub'>Since Last Close</div>
+            <div class='kpi-sub'>B3 session {last_session:%d %b %Y}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -615,13 +455,15 @@ with k3:
     )
 
 with k4:
+    rf_note = "rf = CDI" if rf_per_session is not None else "rf = 0 (CDI unavailable)"
     st.markdown(
         f"""
         <div class='card'>
             <div class='card-title'>Portfolio Stats (YTD)</div>
-            <div class='kpi-line' style='margin-top:0.7rem;'>Vol: <b>{vol_ann:.1f}%</b></div>
-            <div class='kpi-line'>Sharpe: <b>{sharpe:.2f}</b></div>
-            <div class='kpi-line'>Sortino: <b>{sortino:.2f}</b></div>
+            <div class='kpi-line' style='margin-top:0.7rem;'>Vol: <b>{stats['vol']:.1f}%</b></div>
+            <div class='kpi-line'>Sharpe: <b>{stats['sharpe']:.2f}</b></div>
+            <div class='kpi-line'>Sortino: <b>{stats['sortino']:.2f}</b></div>
+            <div class='kpi-sub'>{stats['sessions']} B3 sessions · {rf_note}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -633,136 +475,109 @@ st.markdown("<br>", unsafe_allow_html=True)
 # PERFORMANCE, SCORECARD, & ALLOCATION ROW RENDER
 # ─────────────────────────────────────────────────────────────
 r2c1, r2c2, r2c3 = st.columns([2.2, 2.0, 1.4])
-
-PORTFOLIO_COLOR = "#1f4e79"
-SPY_COLOR = "#5ab4e8"
-SECTOR_PALETTE = [
-    "#3b82f6",
-    "#10b981",
-    "#f59e0b",
-    "#8b5cf6",
-    "#ef4444",
-    "#06b6d4",
-    "#f97316",
-    "#ec4899",
-]
+CHART_LAYOUT = dict(template="plotly_dark", plot_bgcolor=SURFACE, paper_bgcolor=SURFACE)
 
 with r2c1:
-    st.markdown(
-        "<div class='section-h'>Portfolio Performance</div>",
-        unsafe_allow_html=True,
-    )
-    if not perf.empty and "twr" in perf.columns:
-        mask = (perf["date"].dt.date >= range_start) & (
-            perf["date"].dt.date <= range_end
-        )
-        pr = perf.loc[mask].sort_values("date").copy()
-        pr = pr.dropna(subset=["twr"])
-        if not pr.empty:
-            # Auto-detect TWR scale (decimal vs percent) for consistent charting
-            scale = 100 if pr["twr"].abs().max() < 5 else 1
-            pr["twr_pct"] = pr["twr"] * scale
-            # Re-base performance to 0% at the start of the visible date range
-            base_ratio = 1 + pr["twr_pct"].iloc[0] / 100
-            pr["twr_norm"] = ((1 + pr["twr_pct"] / 100) / base_ratio - 1) * 100
-
-            spy_df = fetch_spy(range_start, range_end)
-            if not spy_df.empty:
-                base_spy = spy_df["spy_price"].iloc[0]
-                spy_df["spy_ret"] = (spy_df["spy_price"] - base_spy) / base_spy * 100
-
-            fig = go.Figure()
+    st.markdown("<div class='section-h'>Portfolio Performance</div>", unsafe_allow_html=True)
+    grid = twr_level[(twr_level.index >= range_start) & (twr_level.index <= range_end)].index
+    lines = [
+        ("Portfolio", twr_level, PORTFOLIO_COLOR, "solid"),
+        (spy_label, spy_level, SPY_COLOR, "solid"),
+        ("CDI", cdi_level, CDI_COLOR, "dash"),
+    ]
+    series = {
+        name: (dm.rebased(level.asof(grid), grid[0], grid[-1]), color, dash)
+        for name, level, color, dash in lines
+        if len(grid) > 1 and not level.empty
+    }
+    series = {k: v for k, v in series.items() if not v[0].empty}
+    if "Portfolio" in series:
+        fig = go.Figure()
+        for name, (s, color, dash) in series.items():
             fig.add_trace(
                 go.Scatter(
-                    x=pr["date"],
-                    y=pr["twr_norm"],
+                    x=s.index,
+                    y=s.to_numpy(),
                     mode="lines",
-                    name="Portfolio",
-                    line=dict(color=PORTFOLIO_COLOR, width=3),
+                    name=name,
+                    line=dict(color=color, width=2, dash=dash),
+                    hovertemplate="%{y:+.1f}%",
                 )
             )
-            if not spy_df.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=spy_df["date"],
-                        y=spy_df["spy_ret"],
-                        mode="lines",
-                        name="SPY",
-                        line=dict(color=SPY_COLOR, width=3),
-                    )
-                )
-            fig.update_layout(
-                template="plotly_dark",
-                plot_bgcolor="#1a1d24",
-                paper_bgcolor="#1a1d24",
-                height=320,
-                margin=dict(l=20, r=10, t=10, b=80),
-                xaxis=dict(title="Date", gridcolor="#2a2e38"),
-                yaxis=dict(title="Return (%)", gridcolor="#2a2e38"),
-                legend=dict(
-                    orientation="h",
-                    yanchor="top",
-                    y=-0.25,
-                    xanchor="center",
-                    x=0.5,
-                    bgcolor="rgba(0,0,0,0)",
-                ),
+        # End-of-line direct labels (text ink, not series color), de-collided.
+        ends = {name: float(s.iloc[-1]) for name, (s, _, _) in series.items()}
+        values = pd.concat([s for s, _, _ in series.values()])
+        gap = max(float(values.max() - values.min()) * 0.07, 0.5)
+        for name, y in dm.spread_labels(ends, gap).items():
+            fig.add_annotation(
+                x=series[name][0].index[-1],
+                y=y,
+                text=f"{name} {ends[name]:+.1f}%",
+                xanchor="left",
+                xshift=6,
+                showarrow=False,
+                font=dict(color=TEXT, size=11),
             )
-            st.plotly_chart(
-                fig, use_container_width=True, config={"displayModeBar": False}
-            )
-        else:
-            st.info("No TWR points in selected range.")
+        fig.update_layout(
+            **CHART_LAYOUT,
+            height=320,
+            hovermode="x unified",
+            margin=dict(l=20, r=130, t=10, b=80),
+            xaxis=dict(title="Date", gridcolor=GRID),
+            yaxis=dict(title="Return (%)", gridcolor=GRID, zerolinecolor=GRID),
+            legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+        )
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     else:
-        st.info("No portfolio performance data.")
+        st.info("No TWR points in selected range.")
 
 with r2c2:
-    st.markdown(
-        "<div class='section-h'>Portfolio Performance</div>",
-        unsafe_allow_html=True,
-    )
-    seg = segment_performance(trades, prices, dividends, tick_f)
-    if not seg.empty:
-        disp = seg.copy()
-        disp["YTD Change"] = disp["YTD Change"].apply(lambda x: f"{x:.1f} %")
-        disp["DY %"] = disp["DY %"].apply(lambda x: f"{x:.1f} %")
-        disp["Weight %"] = disp["Weight %"].apply(lambda x: f"{x:.1f} %")
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=260)
+    st.markdown("<div class='section-h'>Segment Scorecard (YTD)</div>", unsafe_allow_html=True)
+    if not scorecard.empty:
+        disp = scorecard.copy()
+        for col in ("YTD Change", "DY %", "Weight %"):
+            disp[col] = disp[col].map(lambda x: f"{x:.1f} %")
+        st.dataframe(disp, hide_index=True, width="stretch", height=260)
+        st.caption("YTD Change: value-weighted price change of current holdings · DY: YTD income ÷ segment value")
     else:
         st.info("No segment data.")
 
+
+def sector_weights(h: pd.DataFrame) -> pd.Series:
+    """Holding value per sector (server-side only; the chart receives weights)."""
+    m = h.merge(assets, on="ticker", how="left")
+    return m.assign(sector=m["sector"].fillna("Unknown")).groupby("sector")["value"].sum()
+
+
 with r2c3:
-    st.markdown(
-        "<div class='section-h'>Sector Allocation</div>", unsafe_allow_html=True
-    )
-    h_all = current_holdings(trades, prices, port_f, tick_f)
-    if not h_all.empty and not assets.empty:
-        m = h_all.merge(assets[["ticker", "sector"]], on="ticker", how="left")
-        m["sector"] = m["sector"].fillna("Unknown")
-        sec = (
-            m.groupby("sector", as_index=False)["value"]
-            .sum()
-            .sort_values("value", ascending=False)
+    st.markdown("<div class='section-h'>Sector Allocation</div>", unsafe_allow_html=True)
+    view = sector_weights(held) if not held.empty else pd.Series(dtype=float)
+    view = view[view > 0]
+    if not view.empty:
+        # Colors follow the sector, fixed by the unfiltered portfolio: filters never repaint.
+        base = dm.fold_other(sector_weights(dm.holdings(trades, actions, adjusted)), len(PALETTE))
+        color_of = dict(zip(base.index, PALETTE, strict=False)) | {"Other": MUTED}  # ≤ 8 slots; tail neutral
+        view = view.groupby(view.index.where(view.index.isin(base.index), "Other")).sum()
+        view = (view / view.sum() * 100.0).sort_values(ascending=False)
+        view = pd.concat([view.drop("Other", errors="ignore"), view.reindex(["Other"]).dropna()])  # tail last
+        fig_d = go.Figure(
+            go.Pie(
+                labels=view.index,
+                values=view.to_numpy(),
+                hole=0.6,
+                sort=False,
+                textinfo="none",
+                marker=dict(colors=[color_of.get(s, MUTED) for s in view.index], line=dict(color=SURFACE, width=2)),
+                hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
+            )
         )
-        fig_d = px.pie(
-            sec,
-            names="sector",
-            values="value",
-            hole=0.6,
-            color_discrete_sequence=SECTOR_PALETTE,
-        )
-        fig_d.update_traces(textinfo="none", hovertemplate="%{label}: %{percent}")
         fig_d.update_layout(
-            template="plotly_dark",
-            plot_bgcolor="#1a1d24",
-            paper_bgcolor="#1a1d24",
+            **CHART_LAYOUT,
             height=300,
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="v", y=0.5, x=1.02),
         )
-        st.plotly_chart(
-            fig_d, use_container_width=True, config={"displayModeBar": False}
-        )
+        st.plotly_chart(fig_d, width="stretch", config={"displayModeBar": False})
     else:
         st.info("No holdings / sector data.")
 
@@ -775,90 +590,64 @@ r3c1, r3c2 = st.columns([1.3, 2.3])
 
 with r3c1:
     st.markdown("<div class='section-h'>Top Holdings</div>", unsafe_allow_html=True)
-    h = current_holdings(trades, prices, port_f, tick_f)
-    if not h.empty:
-        tot_v = h["value"].sum()
-        h = h.copy()
-        h["Weight %"] = h["value"] / tot_v * 100 if tot_v else 0
-        h["Change %"] = h["ticker"].apply(lambda tk: ytd_price_change_pct(prices, tk))
+    if not held.empty:
+        h = held.assign(weight=held["value"] / held["value"].sum() * 100.0, ytd=held["ticker"].map(ytd_by_ticker))
         h = h.sort_values("value", ascending=False).head(10)
-
         disp = pd.DataFrame(
             {
-                "Ticker": h["ticker"].values,
-                "Weight %": h["Weight %"].apply(lambda x: f"{x:.1f}%").values,
-                "Change %": h["Change %"]
-                .apply(
-                    lambda x: (
-                        f"{'▲' if x >= 0 else '▼'} {x:+.1f}%" if pd.notna(x) else "—"
-                    )
-                )
-                .values,
+                "Ticker": h["ticker"].to_numpy(),
+                "Weight %": h["weight"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "—").to_numpy(),
+                "Change % (YTD)": h["ytd"]
+                .map(lambda x: f"{'▲' if x >= 0 else '▼'} {x:+.1f}%" if pd.notna(x) else "—")
+                .to_numpy(),
             }
         )
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=320)
+        st.dataframe(disp, hide_index=True, width="stretch", height=320)
     else:
         st.info("No holdings to show.")
 
 with r3c2:
-    with st.expander("Expander", expanded=True):
+    with st.expander("Income & Activity", expanded=True):
         tab_div, tab_trd = st.tabs(["Dividends", "Last Trades"])
 
         with tab_div:
-            if not dividends.empty:
-                d = dividends.copy().sort_values("dividend_date", ascending=False)
-                if port_f:
-                    d = d[d["portfolio"].isin(port_f)]
-                if tick_f:
-                    d = d[d["ticker"].isin(tick_f)]
-                d = d.head(10)
-
-                if d.empty:
-                    st.info("No dividends match filters.")
-                else:
-                    # Fetch latest prices for individual DY calculation per event
-                    last_px = (
-                        prices.sort_values("date")
-                        .groupby("ticker")
-                        .tail(1)[["ticker", "price"]]
-                    )
-                    d = d.merge(last_px, on="ticker", how="left")
-
-                    # DY per event adjusted to latest market price
-                    d["DY%"] = (d["dividend"] / d["price"]) * 100
-
-                    disp_d = pd.DataFrame(
-                        {
-                            "Date": d["dividend_date"].dt.strftime("%Y-%m-%d"),
-                            "Ticker": d["ticker"],
-                            "DY%": d["DY%"].apply(
-                                lambda x: f"{x:.2f}%" if pd.notna(x) else "—"
-                            ),
-                        }
-                    )
-                    st.dataframe(disp_d, hide_index=True, use_container_width=True)
+            d = dm.income_events(dividends).sort_values("dividend_date", ascending=False)
+            if port_f:
+                d = d[d["portfolio"].isin(port_f)]
+            if tick_f:
+                d = d[d["ticker"].isin(tick_f)]
+            d = d.head(10)
+            if d.empty:
+                st.info("No dividends match filters." if not dividends.empty else "No dividend data.")
             else:
-                st.info("No dividend data.")
+                # Per-event yield on the latest close, split-restated to today's share basis.
+                dy = dm.dividend_yields(d, adjusted, actions)
+                disp_d = pd.DataFrame(
+                    {
+                        "Date": d["dividend_date"].dt.strftime("%Y-%m-%d"),
+                        "Ticker": d["ticker"],
+                        "Type": d["type"],
+                        "DY%": dy.map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—"),
+                    }
+                )
+                st.dataframe(disp_d, hide_index=True, width="stretch")
 
         with tab_trd:
-            if not trades.empty:
-                t = trades.copy().sort_values("date", ascending=False)
-                if port_f:
-                    t = t[t["portfolio"].isin(port_f)]
-                if tick_f:
-                    t = t[t["ticker"].isin(tick_f)]
-                t = t.head(10)
-                if t.empty:
-                    st.info("No trades match filters.")
-                else:
-                    disp_t = pd.DataFrame(
-                        {
-                            "Date": t["date"].dt.strftime("%Y-%m-%d").values,
-                            "Ticker": t["ticker"].values,
-                            "Side": t["side"].fillna("—").values,
-                            "Portfolio": t["portfolio"].fillna("—").values,
-                        }
-                    )
-                    st.dataframe(disp_t, hide_index=True, use_container_width=True)
+            t = trades.sort_values("date", ascending=False, kind="mergesort")
+            if port_f:
+                t = t[t["portfolio"].isin(port_f)]
+            if tick_f:
+                t = t[t["ticker"].isin(tick_f)]
+            t = t.head(10)
+            if t.empty:
+                st.info("No trades match filters." if not trades.empty else "No trade data.")
             else:
-                st.info("No trade data.")
+                disp_t = pd.DataFrame(
+                    {
+                        "Date": t["date"].dt.strftime("%Y-%m-%d").to_numpy(),
+                        "Ticker": t["ticker"].to_numpy(),
+                        "Side": t["side"].fillna("—").to_numpy(),
+                        "Portfolio": t["portfolio"].fillna("—").to_numpy(),
+                    }
+                )
+                st.dataframe(disp_t, hide_index=True, width="stretch")

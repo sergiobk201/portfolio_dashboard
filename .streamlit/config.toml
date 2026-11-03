@@ -1,0 +1,7 @@
+# The dashboard is designed dark-only (cards, charts and text colors assume a
+# dark page); pin the theme so light-mode browsers do not get white-on-white.
+[theme]
+base = "dark"
+
+[browser]
+gatherUsageStats = false
