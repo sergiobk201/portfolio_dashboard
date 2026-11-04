@@ -25,8 +25,11 @@ After 0.4.0 the stored numbers were right, but the public dashboard still comput
   - It catches specific exceptions only. A DB outage shows a message without connection details.
   - Feed failures fall back visibly (SPY price/USD, rf = 0).
 - Privacy: the app no longer queries `portfolio_value`. The sector donut receives weights, not BRL amounts, which the old `px.pie` serialised to the browser.
-- `requirements.txt` is now the pinned dashboard stack for Python 3.10–3.14. Unpinned, Python 3.12 resolved pandas 3.1 and numpy 2.5, majors nobody had tested. Streamlit Cloud runs 3.14, where numpy 2.2 has no wheels, so numpy is pinned per Python version. A `dashboard-cloud` CI job installs the file alone on 3.14, as Cloud does.
-- `tests.yml` installs the dashboard stack too. The daily gate stays pipeline-only, and the AppTest suite skips there.
+- `requirements.txt` is now the pinned dashboard stack for Python 3.11–3.14 (Streamlit Cloud runs 3.14, where numpy 2.2 has no wheels). Unpinned, Python 3.12 resolved pandas 3.1 and numpy 2.5, majors nobody had tested.
+- `tests.yml` tests each stack on the Python it runs on:
+  - `pytest`: the pipelines on 3.10, with the daily gate's stack.
+  - `dashboard-cloud`: `requirements.txt` alone on 3.14, as Cloud installs it, with the AppTest suite.
+  - `monthly-imports`: the real Gmail, PDF and Excel stack on 3.12.
 - Monthly loaders (`gmail_automation.py`, `dividends_pipeline.py`) are now safe to re-run:
   - Rows already stored are skipped and counted.
   - A failed read stops the run before any write, and a failed insert raises instead of printing success.
@@ -46,6 +49,7 @@ After 0.4.0 the stored numbers were right, but the public dashboard still comput
 - Test the failure path: the AppTest suite found that every feed outage crashed the page (an empty fallback `Series` had a RangeIndex).
 - A 2-decimal per-share column is not a per-share amount. Derive it from `total ÷ quantity`.
 - A chart's payload is public even when the axis labels are not: send weights, never amounts.
+- Test each dependency stack on the Python it runs on. One requirements file shared by the 3.10 CI and the 3.14 Cloud app would have broken the Cloud redeploy and failed every Dependabot PR.
 - Let the numbers check themselves. A parser anchored on "the first all-digit token" loads a wrong trade the day the layout shifts; quantity × price = total turns that into a stop.
 
 ## [0.4.0] — 2026-11-03

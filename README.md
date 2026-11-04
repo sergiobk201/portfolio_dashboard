@@ -73,7 +73,7 @@ streamlit run public_app.py
 ## 📦 Installation
 
 ### Requirements
-- Python 3.10–3.14. The Streamlit Cloud app runs 3.14; CI and the pipelines run 3.10. `requirements.txt` pins Streamlit 1.65, and numpy per Python version.
+- Python: the pipelines run 3.10 (`prices_requirements.txt`), the dashboard 3.11–3.14 (`requirements.txt`; Streamlit Cloud runs 3.14), and the monthly imports 3.10–3.13 (`requirements-monthly.txt`). CI tests each stack on the Python it runs on.
 - A Supabase (PostgreSQL) project
 - Gmail API OAuth credentials, for ledger ingestion
 - Docker and the Supabase CLI, for [repairs](#-repairs) only
@@ -141,6 +141,8 @@ python pipelines/calculate_daily_twr.py   # full recompute → portfolio_perform
 
 # Tests (synthetic data only) and the CI syntax check
 pip install -r requirements-dev.txt && python -m pytest
+# Dashboard tests (Python 3.11+, the Streamlit Cloud stack)
+pip install -r requirements.txt pytest && python -m pytest tests/test_dashboard_metrics.py tests/test_public_app.py
 python -m compileall -q pipelines tools public_app.py
 ```
 

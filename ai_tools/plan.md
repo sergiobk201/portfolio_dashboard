@@ -63,5 +63,6 @@ Trigger: the scheduled jobs reported success while TWR, total capital and the ot
 
 ## 🚀 Next Steps
 - [x] Gmail import: process every nota in the Gmail search window, not only the newest, so the monthly cadence cannot skip a trading day. Done in 0.5.0: a 45-day window (`--days N`), idempotent, with line-by-line reconciliation.
+- [ ] Move the pipelines and CI off Python 3.10 (end of life since October 2026) to 3.13. numpy 2.2.6 and pandas 2.3.3 already support 3.13, so the numbers stay identical; then lift Dependabot's numpy/pandas freeze.
 - [ ] Model withdrawals before the first one happens. The engine currently assumes contributions only.
 - [ ] IRPF: add the *custo atribuído* of bonus shares to the cost basis.

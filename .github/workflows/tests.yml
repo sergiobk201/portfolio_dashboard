@@ -18,6 +18,8 @@ env:
 
 jobs:
   pytest:
+    # Pipelines: Python 3.10 and the daily gate's stack. The AppTest suite skips
+    # here (no Streamlit); dashboard-cloud runs it.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -29,10 +31,7 @@ jobs:
           cache-dependency-path: |
             prices_requirements.txt
             requirements-dev.txt
-            requirements.txt
-      # Pipeline + dashboard stacks: the AppTest smoke tests need Streamlit
-      # (the daily gate installs only the pipeline stack and skips them).
-      - run: pip install -r requirements-dev.txt -r requirements.txt
+      - run: pip install -r requirements-dev.txt
       # Syntax gate for code the tests do not import (the Streamlit app, tools/).
       - run: python -m compileall -q pipelines tools public_app.py
       - run: python -m pytest
@@ -53,3 +52,21 @@ jobs:
       # pytest at the requirements-dev.txt pin (that file also pulls the 3.10 pipeline stack).
       - run: pip install -r requirements.txt "$(grep -E '^pytest==' requirements-dev.txt)"
       - run: python -m pytest tests/test_dashboard_metrics.py tests/test_public_app.py
+
+  monthly-imports:
+    # The hand-run Gmail and dividends imports on the README's Python 3.12, with
+    # the real Gmail / PDF / Excel libraries (the other jobs stub them).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            prices_requirements.txt
+            requirements-monthly.txt
+            requirements-dev.txt
+      - run: pip install -r requirements-monthly.txt "$(grep -E '^pytest==' requirements-dev.txt)"
+      - run: python -m pytest

@@ -9,9 +9,9 @@ updates:
       interval: monthly
     open-pull-requests-limit: 2
     ignore:
-      # Pinned to the last releases for the pipelines' Python 3.10 (numpy per Python
-      # version in requirements.txt). A minor or major bump drops 3.10 and would turn
-      # every grouped PR red: move them together with a deliberate Python upgrade.
+      # The pipelines run Python 3.10, where newer numpy and pandas minors do not
+      # install: a bump would turn every grouped PR red. Move them by hand, together
+      # with a Python upgrade (see ai_tools/plan.md).
       - dependency-name: numpy
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       - dependency-name: pandas
