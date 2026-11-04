@@ -25,7 +25,7 @@ After 0.4.0 the stored numbers were right, but the public dashboard still comput
   - It catches specific exceptions only. A DB outage shows a message without connection details.
   - Feed failures fall back visibly (SPY price/USD, rf = 0).
 - Privacy: the app no longer queries `portfolio_value`. The sector donut receives weights, not BRL amounts, which the old `px.pie` serialised to the browser.
-- `requirements.txt` is now the pinned dashboard stack for Python 3.10–3.13. Unpinned, Python 3.12 resolved pandas 3.1 and numpy 2.5, majors nobody had tested.
+- `requirements.txt` is now the pinned dashboard stack for Python 3.10–3.14. Unpinned, Python 3.12 resolved pandas 3.1 and numpy 2.5, majors nobody had tested. Streamlit Cloud runs 3.14, where numpy 2.2 has no wheels, so numpy is pinned per Python version. A `dashboard-cloud` CI job installs the file alone on 3.14, as Cloud does.
 - `tests.yml` installs the dashboard stack too. The daily gate stays pipeline-only, and the AppTest suite skips there.
 - Monthly loaders (`gmail_automation.py`, `dividends_pipeline.py`) are now safe to re-run:
   - Rows already stored are skipped and counted.

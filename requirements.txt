@@ -1,6 +1,9 @@
 # Public dashboard (public_app.py). Streamlit Community Cloud installs this file.
-# Supports Python 3.10-3.13; shared pins must match prices_requirements.txt.
-numpy==2.2.6
+# Python 3.10-3.14: Streamlit Cloud runs 3.14; CI and the pipelines run 3.10,
+# where the shared pins must match prices_requirements.txt. numpy is pinned per
+# Python version: 2.2 is the last release for 3.10 and has no 3.14 wheels.
+numpy==2.2.6; python_version < "3.11"
+numpy==2.3.5; python_version >= "3.11"
 pandas==2.3.3
 plotly==7.1.0
 psycopg2-binary==2.9.13

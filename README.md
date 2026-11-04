@@ -73,7 +73,7 @@ streamlit run public_app.py
 ## 📦 Installation
 
 ### Requirements
-- Python 3.10–3.13 (`requirements.txt` pins Streamlit 1.65; the Streamlit Cloud app must run one of these versions)
+- Python 3.10–3.14. The Streamlit Cloud app runs 3.14; CI and the pipelines run 3.10. `requirements.txt` pins Streamlit 1.65, and numpy per Python version.
 - A Supabase (PostgreSQL) project
 - Gmail API OAuth credentials, for ledger ingestion
 - Docker and the Supabase CLI, for [repairs](#-repairs) only
