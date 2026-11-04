@@ -28,8 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           cache: pip
@@ -53,8 +53,8 @@ jobs:
       PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
       PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           cache: pip
@@ -87,8 +87,8 @@ jobs:
       PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
       PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           cache: pip
