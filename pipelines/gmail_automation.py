@@ -1,19 +1,39 @@
+"""
+gmail_automation.py
+───────────────────
+Monthly trade import: every Rico nota de corretagem e-mailed in the last N days
+(default 45) → `trades`, oldest first.
+
+Each nota runs the full pipeline on fresh state with a fresh database read, so
+it sees what the nota before it just loaded, and the duplicate check
+(ledger_dedupe) skips notas already in the table: re-runs and overlapping
+windows are safe. The batch stops at the first nota that fails.
+
+Usage: python pipelines/gmail_automation.py [--days N] [--keep-pdfs]
+"""
+
+from __future__ import annotations
+
 ### Imports
+import argparse
+import base64
 import os
 import datetime
-import os.path
+import sys
+import traceback
+from dataclasses import dataclass
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import shutil
+from googleapiclient.errors import Error as GoogleApiError
+import httplib2
 import pikepdf
 from pathlib import Path
 import pdfplumber
 import pandas as pd
 import numpy as np
-from typing import Union
+from typing import Any, Sequence, Union
 import re
 import psycopg2
 import uuid
@@ -21,13 +41,38 @@ from typing import Set
 from io import StringIO
 from dotenv import load_dotenv
 import yfinance as yf
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import GoogleAuthError, RefreshError
 
+from ledger_dedupe import TRADE_KEY, LedgerUnavailableError, plan_idempotent_load
 from nota_fees import cblc_fees, extract_dc_flag
+
+try:  # yfinance ≥ 0.2.50 exposes a typed exception hierarchy
+    from yfinance.exceptions import YFException
+except ImportError:  # pragma: no cover - older yfinance
+    YFException = RuntimeError  # type: ignore[misc,assignment]
+
+# Gmail API, OAuth transport, network and attachment-write failures.
+GMAIL_ERRORS = (GoogleApiError, GoogleAuthError, httplib2.HttpLib2Error, OSError, KeyError, ValueError)
+DB_READ_ERRORS = (psycopg2.Error, pd.errors.DatabaseError)
+# Sector/industry lookup is cosmetic: any provider failure falls back to "Unknown".
+YF_INFO_ERRORS = (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, YFException)
+# Operational failures: a nota hitting one is reported as FAILED and stops the
+# batch; anything else is a bug and keeps its full traceback.
+CLI_ERRORS = (
+    psycopg2.Error,
+    pd.errors.DatabaseError,
+    LedgerUnavailableError,
+    pikepdf.PasswordError,  # wrong PASSWORD_PDF
+    pikepdf.PdfError,  # corrupt attachment
+    *GMAIL_ERRORS,
+    IndexError,
+    EOFError,
+)
 
 # --- Path resolution
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+ATTACHMENTS_DIR = PROJECT_ROOT / "attachments"  # git-ignored
 
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 pdf_password = os.getenv("PASSWORD_PDF")
@@ -40,256 +85,377 @@ DB_USER = os.environ.get("user")
 DB_PASSWORD = os.environ.get("password")
 DB_PORT = os.environ.get("port")
 
+# --- Gmail window
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]  # changing scopes → delete token.json
+RICO_SENDER = "noreply@rico.com.vc"  # the sender may change: verify and add more if needed
+DEFAULT_WINDOW_DAYS = 45  # a month plus slack, so a late monthly run still overlaps the last one
+
+# --- Per-nota outcomes
+LOADED = "LOADED"
+ALREADY_LOADED = "ALREADY_LOADED"
+NO_TRADES = "NO_TRADES"
+NO_PDF = "NO_PDF"
+FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class NotaResult:
+    """Outcome of one nota PDF, for the run summary (counts only, never amounts).
+
+    Attributes:
+        message_id: Gmail message the PDF came from.
+        received: Receipt day of the e-mail (ISO, São Paulo time).
+        trade_date: Trading day printed on the nota (ISO); empty if not read.
+        status: LOADED, ALREADY_LOADED, NO_TRADES, NO_PDF or FAILED.
+        inserted: Trade rows inserted.
+        skipped: Nota lines skipped as already in the trades table.
+        error: Failure reason when status is FAILED.
+    """
+
+    message_id: str
+    received: str
+    trade_date: str = ""
+    status: str = LOADED
+    inserted: int = 0
+    skipped: int = 0
+    error: str = ""
+
+
+def gmail_service() -> Any:
+    """Authorised Gmail API client (read-only scope).
+
+    Reuses token.json, refreshes it when expired, and falls back to the
+    browser consent flow with credentials.json (pipelines/ or project root).
+
+    Returns:
+        A googleapiclient Gmail v1 resource.
+
+    Raises:
+        FileNotFoundError: No usable token and no credentials.json.
+    """
+    creds = None
+
+    token_path = SCRIPT_DIR / "token.json"
+    credentials_path = SCRIPT_DIR / "credentials.json"
+
+    # Check project root if credentials.json is not in pipelines/
+    if not credentials_path.exists():
+        root_credentials = PROJECT_ROOT / "credentials.json"
+        if root_credentials.exists():
+            credentials_path = root_credentials
+
+    # The file token.json stores the user's access and refresh tokens, and is
+    # created automatically when the authorization flow completes for the first
+    # time.
+    if token_path.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), GMAIL_SCOPES)
+        except (OSError, ValueError) as e:  # unreadable or malformed → re-authenticate
+            print(f"Error loading token.json: {e}")
+            creds = None
+
+    # If there are no (valid) credentials available, let the user log in.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                print(f"Refresh token expired or invalid, forcing re-authentication: {e}")
+                creds = None  # Force re-authentication flow
+
+        if not creds:
+            if not credentials_path.exists():
+                raise FileNotFoundError(
+                    f"Google OAuth client secrets file 'credentials.json' not found at {credentials_path}.\n"
+                    f"Please download it from the Google Cloud Console (OAuth 2.0 Client IDs -> Desktop client) "
+                    f"and save it to that location to authenticate."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(credentials_path), GMAIL_SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open(token_path, "w") as token:
+            token.write(creds.to_json())
+
+    return build("gmail", "v1", credentials=creds)
+
+
+def nota_query(days: int) -> str:
+    """Gmail search for the Rico notas received in the last ``days`` days."""
+    return f"from: {RICO_SENDER} has:attachment newer_than:{days}d"
+
+
+def list_nota_messages(service: Any, query: str) -> list[dict]:
+    """Every message matching ``query``, across all result pages, oldest first.
+
+    Gmail returns ids newest first, 100 per page; the order used here comes
+    from each message's ``internalDate`` (receipt time, epoch ms) instead.
+
+    Args:
+        service: Gmail v1 resource.
+        query: Gmail search string.
+
+    Returns:
+        Full message resources (payload included), oldest first.
+    """
+    ids: list[str] = []
+    page_token: str | None = None
+    while True:
+        request = {"userId": "me", "q": query}
+        if page_token:
+            request["pageToken"] = page_token
+        response = service.users().messages().list(**request).execute()
+        ids.extend(m["id"] for m in response.get("messages", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    messages = [
+        service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        for message_id in dict.fromkeys(ids)  # de-duplicated, order kept
+    ]
+    return sorted(messages, key=lambda m: (int(m["internalDate"]), m["id"]))
+
+
+def received_day(message: dict) -> str:
+    """Receipt day of a message (ISO, São Paulo time) from its ``internalDate``."""
+    received = pd.Timestamp(int(message["internalDate"]), unit="ms", tz="UTC")
+    return received.tz_convert("America/Sao_Paulo").date().isoformat()
+
+
+def pdf_parts(part: dict) -> list[dict]:
+    """PDF attachment parts of a message payload, in MIME order."""
+    if part.get("parts"):
+        return [pdf for child in part["parts"] for pdf in pdf_parts(child)]
+    filename = part.get("filename") or ""
+    body = part.get("body", {})
+    is_pdf = part.get("mimeType") == "application/pdf" or filename.lower().endswith(".pdf")
+    return [part] if filename and is_pdf and (body.get("attachmentId") or body.get("data")) else []
+
+
+def save_nota_pdfs(service: Any, message: dict, attachments_dir: Path) -> list[Path]:
+    """Download one message's PDF attachments to per-message files.
+
+    Each file is named after the message id and rewritten on every run, and
+    only the paths returned here are processed — a file left by an earlier run
+    is never picked up in place of a failed download.
+
+    Args:
+        service: Gmail v1 resource.
+        message: Full message resource.
+        attachments_dir: Download folder.
+
+    Returns:
+        Paths written by this call; empty when the e-mail has no PDF.
+
+    Raises:
+        GoogleApiError, OSError, …: Download or write failure (GMAIL_ERRORS);
+            the files this call already wrote are removed.
+    """
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    try:
+        for n, part in enumerate(pdf_parts(message["payload"]), start=1):
+            body = part["body"]
+            data = body.get("data") or (  # small attachments come inline
+                service.users()
+                .messages()
+                .attachments()
+                .get(userId="me", messageId=message["id"], id=body["attachmentId"])
+                .execute()["data"]
+            )
+            path = attachments_dir / f"trade_confirmation_{message['id']}_{n}.pdf"
+            path.write_bytes(base64.urlsafe_b64decode(data))
+            written.append(path)
+    except GMAIL_ERRORS:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
+    return written
+
+
+def pdf_text(path: Path, max_pages: int = 5) -> str:
+    """Text of a PDF's first pages (a nota spans one or two)."""
+    with pdfplumber.open(str(path)) as pdf:
+        pages = (page.extract_text() for page in pdf.pages[:max_pages])
+        return "".join(f"{text}\n" for text in pages if text)  # image-only pages yield None
+
+
+TRADE_LINE = re.compile(r"^1-BOVESPA.*$", flags=re.MULTILINE)
+NOTA_COLUMNS = ["market", "side", "type", "asset", "quantity", "price", "total"]
+# Share count: plain digits, or digits with a thousands dot ("1.000").
+QUANTITY_TOKEN = re.compile(r"\d{1,3}(?:\.\d{3})+|\d+")
+
+
+def br_number(token: str) -> float:
+    """Brazilian-format number → float ('1.234,56' → 1234.56, '34,17' → 34.17).
+
+    Raises:
+        ValueError: The token is not a number.
+    """
+    return float(token.replace(".", "").replace(",", "."))
+
+
+def parse_trade_lines(text: str) -> pd.DataFrame:
+    """'1-BOVESPA' lines of a nota → one row per trade (Brazilian number format).
+
+    Each line must reconcile on its own: quantity × price = total, within the
+    rounding of a price printed to the cent. A line read with the wrong anchor
+    (a new layout, a termo or options line) stops the nota instead of loading
+    a wrong trade into the tax ledger.
+
+    Args:
+        text: Nota text.
+
+    Returns:
+        NOTA_COLUMNS frame; empty when the text has no Bovespa lines.
+
+    Raises:
+        ValueError: A line has no quantity / price / total columns, or its
+            numbers do not reconcile.
+    """
+    records = []
+    for n, line in enumerate(TRADE_LINE.findall(text), start=1):
+        parts = line.split()
+
+        market = parts[0]  # 1-BOVESPA
+        side = parts[1]  # C or V
+        tipo = parts[2]  # FRACIONARIO, VISTA, etc.
+
+        # Quantity is the first integer token after the description and its
+        # observation marker (e.g. '@'); price and total follow it.
+        index = next((i for i in range(3, len(parts)) if QUANTITY_TOKEN.fullmatch(parts[i])), None)
+        if index is None or index + 2 >= len(parts):
+            raise ValueError(f"trade line {n}: no quantity / price / total columns — nota layout changed?")
+        description = " ".join(parts[3 : index - 1])
+
+        quantity = int(parts[index].replace(".", ""))
+        raw_price = br_number(parts[index + 1])
+        total = round(br_number(parts[index + 2]), 2)
+        # Tolerance: a per-fill average price printed to the cent, plus the cent on the total.
+        if abs(quantity * raw_price - total) > 0.005 * quantity + 0.01:
+            raise ValueError(f"trade line {n}: quantity × price ≠ total — misread line or new nota layout")
+        price = round(raw_price, 2)
+
+        records.append(
+            {
+                "market": market,
+                "side": side,
+                "type": tipo,
+                "asset": description,
+                "quantity": quantity,
+                "price": price,
+                "total": total,
+            }
+        )
+    return pd.DataFrame(records, columns=NOTA_COLUMNS)
+
+
+def iso_day(text: str | None) -> str:
+    """dd/mm/yyyy → ISO date; anything unparseable is returned as is."""
+    try:
+        return datetime.datetime.strptime(text, "%d/%m/%Y").date().isoformat()
+    except (TypeError, ValueError):
+        return text or ""
+
 
 class GmailRicoImporter:
-    def __init__(self):
+    """Loads ONE downloaded nota PDF into `trades`; use a fresh instance per nota."""
+
+    def __init__(self, pdf_path: Union[str, Path], keep_pdfs: bool = False) -> None:
+        self.pdf_path = Path(pdf_path)
+        stem = self.pdf_path.stem.removeprefix("trade_confirmation_")
+        self.unlocked_path = self.pdf_path.with_name(f"statement_unlocked_{stem}.pdf")
+        self.keep_pdfs = keep_pdfs
         self.df = pd.DataFrame()
         self.full_text = ""
-        self.today = datetime.datetime.now().strftime("%Y-%m-%d")
-        self.pdf_path = ""
-        self.output_pdf = ""
-        self.dst = ""
+        self.trade_date: str | None = None
+        self.lines = 0  # Bovespa lines on the nota
+        self.skipped = 0  # of those, already in the trades table
+        self.inserted = 0
         self.db_trades_df = pd.DataFrame()
         self.db_assets_df = pd.DataFrame()
 
-    def run_pipeline(self):
-        print("--- Starting pipeline ---")
-        self.gmail_import()
+    def run_pipeline(self) -> int:
+        """Load this nota's new trades; return how many rows were inserted.
 
-        if not os.path.exists(self.pdf_path):
-            print("No PDF found to process. Exiting...")
-            return
-
-        self.final_pdf()
-        self.read_pdf()
-        self.extract_fees()
-        self.add_data_to_df()
-        self.get_trades_table()
-        self.get_assets_table()
-
-        self.resolve_trades_df()
-        self.resolve_assets_with_db()
-
-        self.resolve_trades_portfolio()
-        self.validate_trade_ids()
-        self.final_transformation()
-
-        self.load_to_db()
-        print("--- Pipeline Finished Successfully")
-
-    def gmail_import(self):
-
-        # If you modify these scopes, delete the file token.json
-        SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-        creds = None
-
-        token_path = SCRIPT_DIR / "token.json"
-        credentials_path = SCRIPT_DIR / "credentials.json"
-
-        # Check project root if credentials.json is not in pipelines/
-        if not credentials_path.exists():
-            root_credentials = PROJECT_ROOT / "credentials.json"
-            if root_credentials.exists():
-                credentials_path = root_credentials
-
-        # The file token.json stores the user's access and refresh tokens, and is
-        # created automatically when the authorization flow completes for the first
-        # time.
-        if token_path.exists():
-            try:
-                creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            except Exception as e:
-                print(f"Error loading token.json: {e}")
-                creds = None
-
-        # If there are no (valid) credentials available, let the user log in.
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except RefreshError as e:
-                    print(f"Refresh token expired or invalid, forcing re-authentication: {e}")
-                    creds = None  # Force re-authentication flow
-
-            if not creds:
-                if not credentials_path.exists():
-                    raise FileNotFoundError(
-                        f"Google OAuth client secrets file 'credentials.json' not found at {credentials_path}.\n"
-                        f"Please download it from the Google Cloud Console (OAuth 2.0 Client IDs -> Desktop client) "
-                        f"and save it to that location to authenticate."
-                    )
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    str(credentials_path), SCOPES
-                )
-                creds = flow.run_local_server(port=0)
-
-            with open(token_path, "w") as token:
-                token.write(creds.to_json())
-
+        The encrypted and decrypted PDFs are deleted afterwards, also on
+        failure, unless ``keep_pdfs``.
+        """
         try:
-            # Build gmail service
-            service = build("gmail", "v1", credentials=creds)
+            self.final_pdf()
+            self.read_pdf()
+            if self.df.empty:
+                print("⚠️ No '1-BOVESPA' lines — not a Bovespa nota, or the layout changed. Nothing loaded.")
+                return 0
+            self.extract_fees()
+            self.add_data_to_df()
+            self.get_trades_table()  # fresh read: includes the nota loaded just before this one
+            self.get_assets_table()
 
-            # Obtain the last email (30 day window)
-            response = (
-                service.users()
-                .messages()
-                .list(
-                    userId="me",
-                    maxResults=1,
-                    q="from: noreply@rico.com.vc has:attachment newer_than:30d",  # filter is noreply with attachment (the email may change, verify and add more domains if needed)
-                )
-                .execute()
-            )
+            self.resolve_trades_df()
+            new_lines = self.drop_already_loaded()
+            self.skipped = self.lines - new_lines
+            if new_lines == 0:
+                return 0
+            self.resolve_assets_with_db()
 
-            messages = response.get("messages", [])
+            self.resolve_trades_portfolio()
+            self.validate_trade_ids()
+            self.final_transformation()
 
-            if not messages:
-                print("No trade statements")
-            else:
-                print("Last trade statement obtained")
+            self.load_to_db()
+            self.inserted = len(self.df)
+            print("--- Nota loaded")
+            return self.inserted
+        finally:
+            self.discard_pdfs()
 
-            last_msg_id = messages[0]["id"]
+    def result(self, message_id: str, received: str, error: str = "") -> NotaResult:
+        """This nota's outcome for the run summary."""
+        if error:
+            status = FAILED
+        elif self.lines == 0:
+            status = NO_TRADES
+        else:
+            status = LOADED if self.inserted else ALREADY_LOADED
+        return NotaResult(message_id, received, iso_day(self.trade_date), status, self.inserted, self.skipped, error)
 
-            # 2. Get the entire email content
-            msg = (
-                service.users()
-                .messages()
-                .get(userId="me", id=last_msg_id, format="full")
-                .execute()
-            )
-
-            # 3. Search for attachment
-            def walk_parts(part):
-                parts = []
-                if part.get("parts"):
-                    for p in part["parts"]:
-                        parts.extend(walk_parts(p))
-                else:
-                    parts.append(part)
-                return parts
-
-            all_parts = walk_parts(msg["payload"])
-
-            # 4. Download the attachment
-            for part in all_parts:
-                filename = part.get("filename")
-                body = part.get("body", {})
-
-                if filename and body.get("attachmentId"):
-                    attachment_id = body["attachmentId"]
-
-                    # GET attachment request
-                    att = (
-                        service.users()
-                        .messages()
-                        .attachments()
-                        .get(userId="me", messageId=last_msg_id, id=attachment_id)
-                        .execute()
-                    )
-
-                    import base64
-
-                    file_data = base64.urlsafe_b64decode(att["data"])
-                    today = datetime.datetime.now().strftime("%Y-%m-%d")
-                    filename = f"trade_confirmation_{today}.pdf"
-
-                    # Guardar el archivo localmente
-                    attachments_dir = PROJECT_ROOT / "attachments"
-                    attachments_dir.mkdir(parents=True, exist_ok=True)
-                    path = attachments_dir / filename
-
-                    with open(path, "wb") as f:
-                        f.write(file_data)
-
-                    print(f"Attachment descargado: {path}")
-
-        except Exception as e:
-            print("Error:", e)
-
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        self.today = today
-
-        attachments_dir = PROJECT_ROOT / "attachments"
-        pdf_path = str(attachments_dir / f"trade_confirmation_{today}.pdf")
-
-        self.pdf_path = pdf_path
+    def discard_pdfs(self) -> None:
+        """Delete this nota's encrypted and decrypted PDFs (personal data) unless kept."""
+        if self.keep_pdfs:
+            return
+        for path in (self.pdf_path, self.unlocked_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                print(f"Could not delete {path.name}: {e}")
 
     def decrypt_pdf(self, input_path, output_path, password):
         """Open password-protected PDF and save unencrypted copy."""
         with pikepdf.open(input_path, password=password) as pdf:
             pdf.save(output_path)
 
-    def final_pdf(self):
+    def final_pdf(self) -> None:
+        """Decrypt the downloaded nota next to it (PASSWORD_PDF).
 
-        input_pdf = self.pdf_path
-        attachments_dir = PROJECT_ROOT / "attachments"
-        output_pdf_name = f"statement_unlocked_{self.today}.pdf"
-        output_pdf_path = attachments_dir / output_pdf_name
-
-        self.output_pdf = output_pdf_name
-        self.dst = str(attachments_dir)
-
-        self.decrypt_pdf(input_pdf, str(output_pdf_path), pdf_password)
-        print("Decrypted PDF saved:", output_pdf_path)
-
+        Raises:
+            pikepdf.PasswordError: PASSWORD_PDF does not open this PDF.
+        """
         try:
-            os.remove(self.pdf_path)
-            print(f"Removed encrypted PDF: {self.pdf_path}")
-        except Exception as e:
-            print(f"Error removing file {self.pdf_path}: {e}")
+            self.decrypt_pdf(self.pdf_path, self.unlocked_path, pdf_password or "")
+        except pikepdf.PasswordError as e:
+            raise pikepdf.PasswordError(
+                f"{self.pdf_path.name}: PASSWORD_PDF (.env) does not open it — wrong password, or not a nota"
+            ) from e
+        print("Decrypted PDF saved:", self.unlocked_path.name)
 
-    def read_pdf(self):
-
-        with pdfplumber.open(os.path.join(self.dst, self.output_pdf)) as pdf:
-            # Slicing from index 0 to 5 (pages 1 to 5)
-            target_pages = pdf.pages[0:5]
-
-            full_text = ""
-            for page in target_pages:
-                page_text = page.extract_text()
-                if page_text:  # Handle cases where a page might be an image/blank
-                    full_text += page_text + "\n"
-
-            self.full_text = full_text
-
-        trades = re.findall(r"^1-BOVESPA.*$", full_text, flags=re.MULTILINE)
-
-        # 2. Parse each line into structured data
-        records = []
-        for line in trades:
-            parts = line.split()
-
-            market = parts[0]  # 1-BOVESPA
-            side = parts[1]  # C or V
-            tipo = parts[2]  # FRACIONARIO, VISTA, etc.
-
-            # Extract description until '@'
-            result = next((s for s in parts if s.isdigit()), None)
-            index = parts.index(result)
-            description = " ".join(parts[3 : index - 1])
-
-            quantity = int(parts[index])
-
-            # Convert Brazilian decimals 34,17 → 34.17
-            price = round(float(parts[index + 1].replace(",", ".")), 2)
-            total = round(float(parts[index + 2].replace(".", "").replace(",", ".")), 2)
-
-            records.append(
-                {
-                    "market": market,
-                    "side": side,
-                    "type": tipo,
-                    "asset": description,
-                    "quantity": quantity,
-                    "price": price,
-                    "total": total,
-                }
-            )
-
-        # 3. Convert to DataFrame
-        df = pd.DataFrame(records)
-        self.df = df
+    def read_pdf(self) -> None:
+        """Extract the decrypted nota's text, trading day and Bovespa lines."""
+        self.full_text = pdf_text(self.unlocked_path)
+        self.trade_date = self.extract_first_date(self.full_text)  # named in failure reports
+        self.df = parse_trade_lines(self.full_text)
+        self.lines = len(self.df)
 
     def extract_single_value(self, label, text):
         pattern = rf"{label}\s+([\d\.,]+)"
@@ -313,6 +479,11 @@ class GmailRicoImporter:
         )
         print("Total Custos", total_custos)
 
+        labels = {"Total CBLC": total_cblc, "Total Bovespa / Soma": total_bovespa, "Total Custos / Despesas": total_custos}
+        missing = [label for label, value in labels.items() if value is None]
+        if missing:
+            raise ValueError(f"nota text has no {missing} — layout changed?")
+
         total_cblc = round(float(total_cblc.replace(".", "").replace(",", ".")), 2)
         total_bovespa = round(
             float(total_bovespa.replace(".", "").replace(",", ".")), 2
@@ -331,6 +502,8 @@ class GmailRicoImporter:
     def add_data_to_df(self):
 
         trade_date = self.extract_first_date(self.full_text)
+        if trade_date is None:
+            raise ValueError("no trading day (dd/mm/yyyy) in the nota text")
         self.trade_date = trade_date
 
         total_trade_volume = self.df["total"].sum()
@@ -365,9 +538,10 @@ class GmailRicoImporter:
 
             self.connection = connection
 
-            # 2. Define the SQL query
+            # 2. Define the SQL query (date…total feed the re-run duplicate check)
             sql_query = (
-                f"SELECT trade_id, asset, ticker, portfolio FROM {TARGET_TABLE};"
+                "SELECT trade_id, date, side, asset, ticker, quantity, total, portfolio "
+                f"FROM {TARGET_TABLE};"
             )
 
             # 3. Use pandas to execute the query and read directly into a DataFrame
@@ -383,9 +557,9 @@ class GmailRicoImporter:
             print("\n--- DataFrame Head ---")
             print(db_trades_df.head())
 
-        except Exception as e:
+        except DB_READ_ERRORS as e:
             print(f"❌ Database connection or query error: {e}")
-            db_trades_df = pd.DataFrame()  # Ensure DF is empty on failure
+            raise  # an unreadable ledger stops this nota; it must never look empty
 
         finally:
             # Always close the connection
@@ -431,9 +605,9 @@ class GmailRicoImporter:
             print("\n--- DataFrame Head ---")
             print(db_assets_df.head())
 
-        except Exception as e:
+        except DB_READ_ERRORS as e:
             print(f"❌ Database connection or query error: {e}")
-            db_assets_df = pd.DataFrame()  # Ensure DF is empty on failure
+            raise  # an unreadable assets table stops this nota; it must never look empty
 
         finally:
             # Always close the connection
@@ -557,6 +731,29 @@ class GmailRicoImporter:
 
         self.df = self.df[new_order]
         self.df["portfolio"] = None
+
+    def drop_already_loaded(self) -> int:
+        """Drop nota lines the trades table already holds.
+
+        Re-runs, overlapping Gmail windows and re-sent notas all bring back
+        notas already loaded, and trade ids are random, so without this check
+        the same trades would be inserted again.
+
+        Returns:
+            Number of lines left to load.
+        """
+        plan = plan_idempotent_load(self.df, self.db_trades_df, TRADE_KEY)
+        print(
+            f"{len(plan.skipped)} of {len(self.df)} lines of nota {self.trade_date} already in the "
+            f"trades table — skipped as duplicates; {len(plan.new)} new."
+        )
+        if not plan.skipped.empty and not plan.new.empty:
+            # A nota loads all-or-nothing, so a partial match deserves a look.
+            print("⚠️ Partial match — verify these skipped lines are really in the table:")
+            for row in plan.skipped.itertuples(index=False):
+                print(f"   {row.side} {row.quantity} {row.ticker}")
+        self.df = plan.new
+        return len(plan.new)
 
     def resolve_portfolio_with_db(
         self,
@@ -724,7 +921,7 @@ class GmailRicoImporter:
                 info = stock.info
                 industry = info.get("industry", "Unknown")
                 sector = info.get("sector", "Unknown")
-            except Exception as e:
+            except YF_INFO_ERRORS as e:
                 print(f"Could not pull yfinance data for {ticker}: {e}")
 
             new_assets.append(
@@ -744,6 +941,7 @@ class GmailRicoImporter:
 
             assets_columns = new_assets_df.columns.to_list()
 
+            connection = None
             try:
                 connection = psycopg2.connect(
                     host=DB_HOST,
@@ -766,8 +964,9 @@ class GmailRicoImporter:
                         f"Successfully inserted {len(new_assets_df)} rows into assets table"
                     )
 
-            except Exception as e:
-                connection.rollback()
+            except psycopg2.Error as e:
+                if connection:
+                    connection.rollback()
                 print(f"Database error: {e}")
 
             finally:
@@ -781,6 +980,7 @@ class GmailRicoImporter:
         buffer.seek(0)
 
         columns = self.df.columns.to_list()
+        connection = None
         try:
             # 1. Establish the connection
             connection = psycopg2.connect(
@@ -797,28 +997,139 @@ class GmailRicoImporter:
                 connection.commit()
                 print(f"Successfully inserted {len(self.df)} rows into trades table")
 
-        except Exception as e:
-            connection.rollback()
+        except psycopg2.Error as e:
+            if connection:
+                connection.rollback()
             print(f"Database error: {e}")
+            raise  # a failed load must not be reported as a success
 
         finally:
             if connection:
                 connection.close()
 
 
+def import_notas(
+    service: Any,
+    days: int = DEFAULT_WINDOW_DAYS,
+    keep_pdfs: bool = False,
+    attachments_dir: Path | None = None,
+) -> list[NotaResult]:
+    """Import every nota in the Gmail window, oldest first.
+
+    Each PDF gets a fresh importer — fresh state and a fresh database read —
+    so the duplicate check sees everything loaded before it. The batch stops
+    at the first nota that fails; a re-run skips the notas already loaded.
+
+    Args:
+        service: Gmail v1 resource.
+        days: Look-back window in days.
+        keep_pdfs: Keep the downloaded and decrypted PDFs.
+        attachments_dir: Download folder (default: <project>/attachments).
+
+    Returns:
+        One result per nota PDF (or per e-mail without one); a FAILED result,
+        if any, is the last.
+    """
+    folder = attachments_dir or ATTACHMENTS_DIR
+    messages = list_nota_messages(service, nota_query(days))
+    print(f"{len(messages)} Rico e-mail(s) with attachments in the last {days} days — importing oldest first.")
+    results: list[NotaResult] = []
+    for message in messages:
+        received = received_day(message)
+        print(f"\n=== Nota e-mail {message['id']} (received {received}) ===")
+        try:
+            pdfs = save_nota_pdfs(service, message, folder)
+        except GMAIL_ERRORS as e:
+            results.append(NotaResult(message["id"], received, status=FAILED, error=f"download failed: {e}"))
+            return results
+        if not pdfs:
+            print("No PDF attachment — skipped.")
+            results.append(NotaResult(message["id"], received, status=NO_PDF))
+        for i, pdf in enumerate(pdfs):
+            importer = GmailRicoImporter(pdf, keep_pdfs=keep_pdfs)
+            try:
+                importer.run_pipeline()
+            except CLI_ERRORS as e:
+                results.append(importer.result(message["id"], received, error=f"{type(e).__name__}: {e}"))
+                if not keep_pdfs:  # this e-mail's other PDFs will not be processed
+                    for rest in pdfs[i + 1 :]:
+                        rest.unlink(missing_ok=True)
+                return results
+            results.append(importer.result(message["id"], received))
+    return results
+
+
+def summary_lines(results: list[NotaResult]) -> list[str]:
+    """One line per nota (days, e-mail, status, counts) plus a total — counts only."""
+    lines = [
+        f"nota {r.trade_date or '----------'}  received {r.received}  {r.message_id}  "
+        f"{r.status:<14}  inserted {r.inserted:>3}  skipped {r.skipped:>3}"
+        for r in results
+    ]
+    lines.append(
+        f"TOTAL {len(results)} nota(s): inserted {sum(r.inserted for r in results)}, "
+        f"skipped {sum(r.skipped for r in results)} (already loaded)"
+    )
+    return lines
+
+
+def positive_days(text: str) -> int:
+    """argparse type for --days: a whole number of days ≥ 1."""
+    days = int(text)  # ValueError → argparse reports an invalid value
+    if days < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return days
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Command-line options of the monthly trade import."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import every Rico nota de corretagem e-mailed in the last N days into the trades "
+            "table, oldest first. Notas already loaded are skipped, so re-runs are safe."
+        ),
+    )
+    parser.add_argument(
+        "--days",
+        type=positive_days,
+        default=DEFAULT_WINDOW_DAYS,
+        metavar="N",
+        help="Gmail look-back window in days (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--keep-pdfs",
+        action="store_true",
+        help="keep the downloaded and decrypted PDFs in attachments/ (deleted by default: personal data)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point; returns the exit code (1 when a nota failed)."""
+    args = parse_args(argv)
+    print("--- Starting pipeline ---")
+    results = import_notas(gmail_service(), days=args.days, keep_pdfs=args.keep_pdfs)
+
+    print("\n--- Summary ---")
+    for line in summary_lines(results):
+        print(line)
+
+    failed = next((r for r in results if r.status == FAILED), None)
+    if failed:
+        print(
+            f"\n✖ Stopped at nota {failed.trade_date or '(trading day not read)'} — e-mail "
+            f"{failed.message_id}, received {failed.received}: {failed.error}"
+        )
+        print("  Notas before it are loaded. Fix the cause and re-run: loaded notas are skipped.")
+        return 1
+    print("Trade statement import successful!" if any(r.inserted for r in results) else "No new trades to import.")
+    return 0
+
+
 if __name__ == "__main__":
-    import sys
-
     try:
-        importer = GmailRicoImporter()
-        importer.run_pipeline()
-        print("Trade statement import successful!")
-
-    except Exception as e:
+        sys.exit(main())
+    except CLI_ERRORS as e:  # Gmail authorisation or listing failed before any nota
         print(f"Program error: {e}")
-        import traceback
-
         traceback.print_exc()
-
-
-# TODO check the trade ID generator
+        sys.exit(1)

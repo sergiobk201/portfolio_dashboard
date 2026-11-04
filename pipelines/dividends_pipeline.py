@@ -1,6 +1,5 @@
 # imports
 import pandas as pd
-import datetime as dt
 import numpy as np
 import uuid
 from typing import Set
@@ -9,9 +8,102 @@ from dotenv import load_dotenv
 import os
 from io import StringIO
 
+from ledger_dedupe import DIVIDEND_KEY, LedgerUnavailableError, plan_idempotent_load
+
 
 load_dotenv()
 unresolved_placeholder = "!!!_input_required_!!!"
+
+INCOME_TYPES = ["JUROS", "DIVIDENDOS", "FRAÇÕES", "RENDIMENTOS"]
+# "<TYPE> … <TICKER> <word> <QTY>"; FRAÇÕES lines end with the ticker instead.
+PER_SHARE_TYPES = ["JUROS", "DIVIDENDOS", "RENDIMENTOS"]
+
+DB_READ_ERRORS = (psycopg2.Error, pd.errors.DatabaseError)
+# Operational failures reported by the CLI; anything else is a bug and keeps
+# its full traceback.
+CLI_ERRORS = (
+    psycopg2.Error,
+    pd.errors.DatabaseError,
+    LedgerUnavailableError,
+    OSError,  # statement file missing / unreadable
+    ImportError,  # read_excel needs openpyxl
+    ValueError,  # unreadable workbook or malformed statement line
+    KeyError,
+    IndexError,
+    EOFError,
+)
+
+
+def parse_statement(raw: pd.DataFrame) -> pd.DataFrame:
+    """Income rows from a broker statement sheet.
+
+    Args:
+        raw: The sheet as read below its 13-row header. Columns 1, 2, 3, 5, 6
+            hold the movement date, clearing date, description, amount and
+            running balance; the ledger ends at the first blank movement date.
+
+    Returns:
+        One row per income line, in the dividends-table column order, with
+        unresolved ids and portfolios.
+    """
+    file = raw.iloc[:, [1, 2, 3, 5, 6]].copy()
+    file.columns = [
+        "dividend_date",
+        "clearing_date",
+        "description",
+        "total",
+        "balance",
+    ]
+    blank = file["dividend_date"].isna().to_numpy()
+    if blank.any():  # without a blank row argmax() is 0 and nothing would load
+        file = file.iloc[: int(blank.argmax())].copy()
+
+    file["dividend_date"] = pd.to_datetime(file["dividend_date"])
+    file["clearing_date"] = pd.to_datetime(file["clearing_date"])
+    file["dividend_date"] = file["dividend_date"].dt.date
+    file["clearing_date"] = file["clearing_date"].dt.date
+
+    file["type"] = file["description"].str.split().str[0]
+
+    filtered = file[file["type"].isin(INCOME_TYPES)].copy()
+
+    # 1. Split the description into a list of words
+    description_split = filtered["description"].str.split()
+
+    # 2. Define the condition
+    is_standard_type = filtered["type"].isin(PER_SHARE_TYPES)
+
+    # 3. Use np.where (Condition, Value if True, Value if False)
+    filtered["ticker"] = np.where(
+        is_standard_type,
+        description_split.str[-3],  # Standard ticker position
+        description_split.str[-1],  # FRAÇÕES ticker position
+    )
+
+    filtered["quantity"] = np.where(
+        is_standard_type,
+        description_split.str[-1],  # Standard quantity position
+        "1",  # Default for FRAÇÕES
+    )
+
+    filtered["quantity"] = filtered["quantity"].astype("int32")
+    filtered["total"] = filtered["total"].astype("float64")
+    filtered["dividend"] = (filtered["total"] / filtered["quantity"]).round(2)
+    filtered["portfolio"] = unresolved_placeholder
+    filtered["dividend_id"] = None
+
+    return filtered[
+        [
+            "dividend_id",
+            "dividend_date",
+            "ticker",
+            "type",
+            "dividend",
+            "total",
+            "quantity",
+            "portfolio",
+        ]
+    ]
 
 # --- supabase env variables
 db_host = os.environ.get("host")
@@ -25,13 +117,17 @@ class DividendsPipeline:
     def __init__(self, file):
         self.file = file
 
-    def run_pipeline(self):
+    def run_pipeline(self) -> int:
+        """Load the statement's new income rows; return how many were inserted."""
         self.get_trades_db()
         self.get_dividends_db()
         self.transform_file()
+        if self.drop_already_loaded() == 0:
+            return 0
         self.resolve_ids_diviends_with_db()
         self.resolve_trades_portfolio()
         self.load_new_divs()
+        return len(self.df)
 
     def get_trades_db(self):
 
@@ -53,7 +149,7 @@ class DividendsPipeline:
 
             trades_df_db = pd.read_sql_query(trades_query, connection)
 
-        except Exception as e:
+        except DB_READ_ERRORS as e:
             print(f"there was a database error: {e}")
             trades_df_db = pd.DataFrame()
 
@@ -84,7 +180,7 @@ class DividendsPipeline:
 
             div_df_db = pd.read_sql_query(div_query, connection)
 
-        except Exception as e:
+        except DB_READ_ERRORS as e:
             print(f"there was a database error: {e}")
             div_df_db = pd.DataFrame()
 
@@ -96,70 +192,27 @@ class DividendsPipeline:
         self.div_df = div_df_db
 
     def transform_file(self):
-        file = pd.read_excel(self.file, skiprows=13)
-        file = file.iloc[:, [1, 2, 3, 5, 6]]
-        file.columns = [
-            "dividend_date",
-            "clearing_date",
-            "description",
-            "total",
-            "balance",
-        ]
-        first_null = file["dividend_date"].isna().argmax()
-        file = file.iloc[:first_null]
+        self.df = parse_statement(pd.read_excel(self.file, skiprows=13))
 
-        file["dividend_date"] = pd.to_datetime(file["dividend_date"])
-        file["clearing_date"] = pd.to_datetime(file["clearing_date"])
-        file["dividend_date"] = file["dividend_date"].dt.date
-        file["clearing_date"] = file["clearing_date"].dt.date
+    def drop_already_loaded(self) -> int:
+        """Drop statement rows the dividends table already holds.
 
-        file["type"] = file["description"].str.split().str[0]
+        Statements overlap (re-downloads, wider date ranges) and every run
+        mints random ids, so without this a re-run duplicates income.
 
-        filtered = file.copy()
-
-        filtered = filtered[
-            filtered["type"].isin(["JUROS", "DIVIDENDOS", "FRAÇÕES", "RENDIMENTOS"])
-        ]
-
-        # 1. Split the description into a list of words
-        description_split = filtered["description"].str.split()
-
-        # 2. Define the condition
-        is_standard_type = filtered["type"].isin(["JUROS", "DIVIDENDOS", "RENDIMENTOS"])
-
-        # 3. Use np.where (Condition, Value if True, Value if False)
-        filtered["ticker"] = np.where(
-            is_standard_type,
-            description_split.str[-3],  # Standard ticker position
-            description_split.str[-1],  # FRAÇÕES ticker position
+        Returns:
+            Number of rows left to load.
+        """
+        plan = plan_idempotent_load(self.df, self.div_df, DIVIDEND_KEY)
+        print(
+            f"{len(plan.skipped)} of {len(self.df)} statement rows already in the "
+            f"dividends table — skipped as duplicates; {len(plan.new)} new."
         )
-
-        filtered["quantity"] = np.where(
-            is_standard_type,
-            description_split.str[-1],  # Standard quantity position
-            "1",  # Default for FRAÇÕES
-        )
-
-        filtered["quantity"] = filtered["quantity"].astype("int32")
-        filtered["total"] = filtered["total"].astype("float64")
-        filtered["dividend"] = (filtered["total"] / filtered["quantity"]).round(2)
-        filtered["portfolio"] = unresolved_placeholder
-        filtered["dividend_id"] = None
-
-        filtered = filtered[
-            [
-                "dividend_id",
-                "dividend_date",
-                "ticker",
-                "type",
-                "dividend",
-                "total",
-                "quantity",
-                "portfolio",
-            ]
-        ]
-
-        self.df = filtered
+        if not plan.skipped.empty:
+            dates = plan.skipped["dividend_date"]
+            print(f"   skipped rows span {dates.min()} → {dates.max()}")
+        self.df = plan.new
+        return len(plan.new)
 
     def add_validated_dividend_id_for_missing_robust(
         self, df: pd.DataFrame, db_df: pd.DataFrame = None
@@ -271,7 +324,7 @@ class DividendsPipeline:
                     )
                 else:
                     df_copy.loc[idx, portfolio_column] = unresolved_placeholder
-            except Exception as e:
+            except (EOFError, OSError, ValueError):  # no usable stdin
                 df_copy.loc[idx, portfolio_column] = unresolved_placeholder
 
         return df_copy
@@ -299,20 +352,16 @@ class DividendsPipeline:
                 password=db_password,
                 port=db_port,
             )
-
-        except Exception as e:
-            print(f"database error: {e}")
-
-        try:
             with connection.cursor() as cur:
                 cur.copy_from(file=buffer, table="dividends", sep="|", columns=columns)
                 connection.commit()
                 print(f"successfully loaded {len(self.df)} rows to dividends table")
 
-        except Exception as e:
+        except psycopg2.Error as e:
             if connection:
                 connection.rollback()
             print(f"database error: {e}")
+            raise  # a failed load must not be reported as a success
 
         finally:
             if connection:
@@ -321,15 +370,17 @@ class DividendsPipeline:
 
 if __name__ == "__main__":
     import sys
+    import traceback
 
     try:
         file_path = input("drag and drop dividends file here").strip(" \"'")
         dividend_loader = DividendsPipeline(file_path)
-        dividend_loader.run_pipeline()
-        print("Dividends loaded successfully!")
+        if dividend_loader.run_pipeline():
+            print("Dividends loaded successfully!")
+        else:
+            print("No new dividends to load.")
 
-    except Exception as e:
+    except CLI_ERRORS as e:
         print(f"program error: {e}")
-        import traceback
-
         traceback.print_exc()
+        sys.exit(1)  # a failed import must not look like a clean run
