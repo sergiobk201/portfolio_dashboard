@@ -27,14 +27,41 @@ Build a professional, investor-grade dashboard for transparent quarterly reporti
 - [X] Implement interactive Plotly charts for cumulative returns vs. benchmark (S&P 500).
 - [X] Style the app with custom CSS to match an institutional/professional look.
 - [X] Add advanced risk metrics: Annualized Volatility, Sharpe Ratio, and Sortino Ratio.
-- [X] Integrate 13-week T-bill yield (^IRX) as the risk-free rate proxy.
+- [X] Integrate 13-week T-bill yield (^IRX) as the risk-free rate proxy (replaced by CDI in v0.5.0).
 - [X] Consolidate KPI tiles for cleaner benchmark comparison.
 
-### [ ] Phase 4: Investor-Ready Dashboard (Public Mode)
-- [ ] Implement "Public Mode" toggle to mask all absolute BRL (R$) amounts.
-- [ ] Pivot "Top Holdings" and "Trades" to focus on % Weights and Units.
-- [ ] Standardize metrics to TWR, Dividend Yield %, and Relative Contribution.
-- [ ] Ensure no nominal currency figures are inferable from the UI.
+### [X] Phase 4: Investor-Ready Dashboard (Public Mode)
+- [X] ~~"Public Mode" toggle~~ superseded: the app is public-only. It opens a read-only session, never queries nominal values and sends only percentages and weights to the browser.
+- [X] "Top Holdings" and "Trades" show % weights. Units are deliberately hidden, because units × public prices would reveal BRL amounts.
+- [X] Metrics standardised on TWR, CDI-based Sharpe/Sortino, SPY total return in BRL and exact per-event DY %.
+- [X] No nominal figure is inferable: the chart payloads carry only rebased % and weights (asserted in `tests/test_public_app.py`).
+- [ ] Relative contribution per holding and segment (share of TWR). Not built yet.
 
-## 🚀 Next Step
-- **Implement the "Public Mode" logic in `app.py` to support the Base 1000 re-basing.**
+### [X] Phase 5: Nov 2026 rebuild
+Trigger: the scheduled jobs reported success while TWR, total capital and the other KPIs had drifted away from what the ledger implies.
+- [X] Root-caused the drift:
+  - dividend-adjusted closes stored as raw prices;
+  - splits and bonuses never applied to share counts;
+  - ticker renames left valuation gaps;
+  - TWR recomputed from a frozen window;
+  - duplicate and holiday price rows;
+  - SPY rows dated one session late;
+  - the CBLC fee sign was flipped on sell notes.
+- [X] `portfolio_engine.py`: a pure, vectorized engine. It covers corporate-action-aware positions, implied contributions, start-of-day-flow TWR, validation gates and XIRR.
+- [X] Official B3 COTAHIST closes with per-row provenance. Fallback rows are upgraded automatically.
+- [X] `sql/001`: unique keys, mandatory provenance, `corporate_actions`, `is_trading_day`, and backups in a non-API schema.
+- [X] Historical backfill deployed to prod as one rehearsed, fingerprint-guarded transaction.
+- [X] One gated daily workflow (tests → prices + SPY → full recompute), with an idempotent retry and a schedule keepalive. The old workflows are retired.
+- [X] CI: synthetic-data test suite, `compileall` syntax gate, and monthly grouped Dependabot updates.
+- [X] `tools/`: reusable guarded-repair flow (rebuild → dress rehearsal → apply) with a runbook. Ledger fixes are backed up automatically.
+- [X] Dashboard statistics moved onto the engine (`dashboard_metrics.py`):
+  - corporate-action-aware holdings and YTD;
+  - risk statistics on B3 sessions;
+  - CDI as the risk-free rate;
+  - SPY total return in BRL as the benchmark.
+- [X] README: monthly routine, Telegram alert guide, repairs runbook and methodology. Obsolete prototype notebooks removed.
+
+## 🚀 Next Steps
+- [x] Gmail import: process every nota in the Gmail search window, not only the newest, so the monthly cadence cannot skip a trading day. Done in 0.5.0: a 45-day window (`--days N`), idempotent, with line-by-line reconciliation.
+- [ ] Model withdrawals before the first one happens. The engine currently assumes contributions only.
+- [ ] IRPF: add the *custo atribuído* of bonus shares to the cost basis.
