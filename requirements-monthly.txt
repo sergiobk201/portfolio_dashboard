@@ -1,11 +1,11 @@
 # Monthly ledger ingestion, run locally: gmail_automation.py and dividends_pipeline.py.
 # Python 3.10-3.13. Data-library pins are shared with the daily pipeline stack.
 -r prices_requirements.txt
-google-api-python-client==2.90.0
+google-api-python-client==2.201.0
 google-auth==2.62.1
-google-auth-httplib2==0.1.0
-google-auth-oauthlib==1.0.0
+google-auth-httplib2==0.4.4
+google-auth-oauthlib==1.5.0
 httplib2==0.32.1
 openpyxl==3.1.5     # pandas.read_excel for the Rico statement export
 pdfplumber==0.11.10
-pikepdf==10.13.0.post1
+pikepdf==10.17.0
