@@ -21,9 +21,11 @@ Write policy
 
 Telegram
   • A digest for every B3 session the run appends: day, MTD, YTD and
-    inception TWR, value and P&L. One per session, so a retry or a weekend
-    run stays quiet; no digest the day after a session means check Actions.
+    inception TWR, value, P&L and the count of open warnings. One per
+    session, so a retry or a weekend run stays quiet; no digest the day
+    after a session means check Actions.
   • Alerts for anything that needs a human look (see build_alerts).
+  • ``--all-warnings`` also sends every open warning (on demand).
 
 Public-log hygiene: the repository and its Actions logs are public, so stdout
 carries dates, counts and percentages only. Amounts go to Telegram.
@@ -33,7 +35,10 @@ Requires sql/001_integrity_corporate_actions.sql (``is_trading_day``).
 
 from __future__ import annotations
 
+import argparse
 import sys
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -80,6 +85,7 @@ class Digest:
     ytd: float
     itd: float  # cumulative TWR since inception
     value: float
+    open_warnings: tuple[tuple[str, int], ...] = ()  # (code, count), most frequent first
 
 
 def for_storage(perf: pd.DataFrame) -> pd.DataFrame:
@@ -180,13 +186,39 @@ def _brl(value: float) -> str:
     return f"R$ {value:,.2f}"
 
 
-def build_alerts(result: EngineResult, new: pd.DataFrame, stored: pd.DataFrame, plan: SyncPlan) -> list[str]:
-    """Telegram messages worth a human look (amounts allowed: private channel)."""
+def build_alerts(
+    result: EngineResult,
+    new: pd.DataFrame,
+    stored: pd.DataFrame,
+    plan: SyncPlan,
+    list_all: bool = False,
+) -> list[str]:
+    """Telegram messages worth a human look (amounts allowed: private channel).
+
+    A warning is listed when it is dated on a day this run wrote: appended,
+    or changed by a late ledger entry, price or corporate action. Warnings
+    on untouched days stay quiet, so a retry never repeats them; the digest
+    counts them instead, and ``list_all`` sends every one on demand.
+    """
     alerts: list[str] = []
     fresh_after = plan.previous_end if plan.previous_end is not None else pd.Timestamp.min
-    fresh = [i for i in result.warnings if i.code == "TRUNCATED_END" or (i.date is not None and i.date > fresh_after)]
-    if fresh:
-        alerts.append(f"⚠️ <b>New data warnings</b>\n{_issue_lines(fresh)}")
+    if list_all:
+        listed = result.warnings
+        alerts.append(
+            f"⚠️ <b>All open warnings ({len(listed)})</b>\n{_issue_lines(listed, limit=40)}"
+            if listed
+            else "✅ No open warnings"
+        )
+    else:
+        written_from = plan.upserts["date"].min() if not plan.upserts.empty else None
+        fresh = [
+            i
+            for i in result.warnings
+            if i.code == "TRUNCATED_END"
+            or (written_from is not None and i.date is not None and i.date >= written_from)
+        ]
+        if fresh:
+            alerts.append(f"⚠️ <b>New data warnings</b>\n{_issue_lines(fresh)}")
 
     if plan.revised_from is not None and not stored.empty:
         old_end = stored.loc[pd.to_datetime(stored["date"]) == plan.previous_end]
@@ -216,7 +248,7 @@ def _growth_since(level: pd.Series, base: pd.Timestamp) -> float:
     return float(level.iloc[-1]) / start - 1.0
 
 
-def build_digest(new: pd.DataFrame, plan: SyncPlan) -> Digest | None:
+def build_digest(new: pd.DataFrame, plan: SyncPlan, warnings: Sequence[Issue] = ()) -> Digest | None:
     """Digest for the newest session this run appends, or None.
 
     The span starts at the last session already stored, so a catch-up run
@@ -226,6 +258,7 @@ def build_digest(new: pd.DataFrame, plan: SyncPlan) -> Digest | None:
     Args:
         new: Output of :func:`for_storage` for this run.
         plan: This run's SyncPlan; ``previous_end`` marks what was stored.
+        warnings: The engine's open warnings, counted by code in the digest.
 
     Returns:
         Digest, or None when no session was appended.
@@ -261,6 +294,7 @@ def build_digest(new: pd.DataFrame, plan: SyncPlan) -> Digest | None:
         ytd=_growth_since(level, pd.Timestamp(session.year, 1, 1) - day_before),
         itd=float(last["twr"]),
         value=float(last["portfolio_value"]),
+        open_warnings=tuple(sorted(Counter(i.code for i in warnings).items(), key=lambda kv: (-kv[1], kv[0]))),
     )
 
 
@@ -272,19 +306,23 @@ def format_digest(d: Digest) -> str:
         label = "Day"
     else:
         label = f"Since {d.base.date()} ({d.sessions} sessions)"
-    return "\n".join(
-        [
-            f"📊 <b>Portfolio — {d.session:%a %Y-%m-%d}</b>",
-            f"{label}: <b>{d.period_return:+.2%}</b> (R$ {d.pnl:+,.2f})",
-            f"MTD {d.mtd:+.2%} · YTD {d.ytd:+.2%}",
-            f"TWR since inception {d.itd:+.2%}",
-            f"Value {_brl(d.value)}",
-        ]
-    )
+    lines = [
+        f"📊 <b>Portfolio — {d.session:%a %Y-%m-%d}</b>",
+        f"{label}: <b>{d.period_return:+.2%}</b> (R$ {d.pnl:+,.2f})",
+        f"MTD {d.mtd:+.2%} · YTD {d.ytd:+.2%}",
+        f"TWR since inception {d.itd:+.2%}",
+        f"Value {_brl(d.value)}",
+    ]
+    if d.open_warnings:
+        lines.append("⚠️ Open warnings: " + " · ".join(f"{escape(code)} ×{n}" for code, n in d.open_warnings))
+    return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Recompute, validate and sync. Returns the process exit code."""
+    parser = argparse.ArgumentParser(description="Recompute portfolio_performance from the ledger.")
+    parser.add_argument("--all-warnings", action="store_true", help="also send every open warning to Telegram")
+    args = parser.parse_args(argv)
     load_dotenv()
     now = datetime.now(B3_TZ)
     end = yesterday(B3_TZ, now)
@@ -324,11 +362,13 @@ def main() -> int:
     print(f"[twr] cumulative TWR {last['twr']:+.4%} | last daily return {last['daily_return']:+.4%}")
 
     # Digest first, alerts last: the newest notification is the one on top.
-    digest = build_digest(new, plan)
+    digest = build_digest(new, plan, result.warnings)
     if digest is not None:
         print(f"[twr] digest for session {digest.session.date()} ({digest.sessions} appended)")
         send_telegram(format_digest(digest))
-    alerts = build_alerts(result, new, stored, plan)
+    if args.all_warnings:
+        print(f"[twr] sending all {len(result.warnings)} open warning(s)")
+    alerts = build_alerts(result, new, stored, plan, list_all=args.all_warnings)
     if alerts:
         send_telegram("\n\n".join(alerts))
     return 0

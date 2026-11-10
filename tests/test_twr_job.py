@@ -10,13 +10,14 @@ import pytest
 
 from calculate_daily_twr import (
     REVISION_GRACE_DAYS,
+    build_alerts,
     build_digest,
     for_storage,
     format_digest,
     plan_sync,
     shrink_days,
 )
-from portfolio_engine import PERFORMANCE_COLUMNS
+from portfolio_engine import PERFORMANCE_COLUMNS, EngineResult, Issue
 
 DAYS = pd.date_range("2025-01-01", periods=40, freq="D")  # Wed 2025-01-01 … Sun 2025-02-09
 
@@ -154,3 +155,51 @@ def test_first_run_digest_covers_the_whole_history():
     assert d.base is None and d.period_return == pytest.approx(d.itd)
     assert d.pnl == pytest.approx(new["portfolio_value"].iloc[-1] - 1000.0)  # net of the opening inflow
     assert format_digest(d).splitlines()[1].startswith("Since inception: <b>")
+
+
+# ── Warning alerts ───────────────────────────────────────────────────────────
+
+
+def _result(issues: list[Issue]) -> EngineResult:
+    empty = pd.DataFrame()
+    return EngineResult(performance=empty, positions=empty, prices=empty, corporate_action_log=empty, issues=issues)
+
+
+WARNINGS = [
+    Issue("WARNING", "NEGATIVE_FEE", "AAAA3 SELL: negative fee", DAYS[5]),  # the back-dated row
+    Issue("WARNING", "STALE_PRICE", "BBBB4: old streak", DAYS[3]),  # before anything this run wrote
+    Issue("WARNING", "NEGATIVE_FEE", "CCCC3 SELL: negative fee", DAYS[-1]),
+]
+
+
+def _warning_alert(alerts: list[str]) -> str:
+    return next((a for a in alerts if a.startswith("⚠️")), "")
+
+
+def test_back_dated_change_alerts_the_warnings_on_the_days_it_rewrote():
+    changed = series()
+    changed.loc[5, "portfolio_value"] += 5.0  # a late ledger entry rewrites day 5 onwards
+    new, stored = for_storage(changed), as_db(series())
+    alert = _warning_alert(build_alerts(_result(WARNINGS), new, stored, plan_sync(new, stored)))
+    assert "AAAA3 SELL" in alert and "CCCC3 SELL" in alert and "BBBB4" not in alert
+
+
+def test_a_retry_never_repeats_standing_warnings():
+    full = for_storage(series())
+    assert build_alerts(_result(WARNINGS), full, as_db(series()), plan_sync(full, as_db(series()))) == []
+
+
+def test_all_warnings_on_demand_lists_every_one():
+    full = for_storage(series())
+    plan = plan_sync(full, as_db(series()))
+    alert = _warning_alert(build_alerts(_result(WARNINGS), full, as_db(series()), plan, list_all=True))
+    assert alert.startswith("⚠️ <b>All open warnings (3)</b>") and "BBBB4" in alert
+    assert build_alerts(_result([]), full, as_db(series()), plan, list_all=True) == ["✅ No open warnings"]
+
+
+def test_digest_counts_open_warnings_most_frequent_first():
+    new = for_storage(series(DAYS[:-2]))
+    d = build_digest(new, plan_sync(new, as_db(series(DAYS[:-3]))), [WARNINGS[1], WARNINGS[0], WARNINGS[2]])
+    assert d.open_warnings == (("NEGATIVE_FEE", 2), ("STALE_PRICE", 1))
+    assert format_digest(d).splitlines()[-1] == "⚠️ Open warnings: NEGATIVE_FEE ×2 · STALE_PRICE ×1"
+    assert "Open warnings" not in format_digest(build_digest(new, plan_sync(new, as_db(series(DAYS[:-3])))))

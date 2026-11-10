@@ -177,6 +177,27 @@ def normalize_corporate_actions(actions: pd.DataFrame | None) -> pd.DataFrame:
 
 # ── Building blocks ───────────────────────────────────────────────────────────
 
+# corporate_actions.ratio is NUMERIC(18,10): a repeating ratio is stored rounded
+# (1/3 → 0.3333333333), so held × ratio can miss a whole number by held × 5e-11.
+RATIO_STORAGE_PRECISION = 1e-10
+
+
+def entitled_shares(held: float | np.ndarray, ratio: float | np.ndarray) -> np.ndarray:
+    """Whole shares after a corporate action; B3 auctions the fractions.
+
+    Args:
+        held: Shares held at the end of the day before the ex-date.
+        ratio: New shares per old share, as stored.
+
+    Returns:
+        floor(held × ratio), except that a product within the ratio's storage
+        precision of a whole number is that number (300 × 0.3333333333 → 100).
+    """
+    exact = np.asarray(held, dtype=float) * np.asarray(ratio, dtype=float)
+    nearest = np.round(exact)
+    tolerance = np.abs(held) * RATIO_STORAGE_PRECISION + 1e-9  # + float noise
+    return np.where(np.abs(exact - nearest) <= tolerance, nearest, np.floor(exact))
+
 
 def build_positions(
     trades: pd.DataFrame,
@@ -211,8 +232,7 @@ def build_positions(
         held = float(deltas.loc[: ev.ex_date - pd.Timedelta(days=1), ev.ticker].sum())
         if held <= 0:
             continue
-        exact = held * ev.ratio
-        new = float(np.floor(exact + 1e-9))
+        new = float(entitled_shares(held, ev.ratio))
         if new != held:
             deltas.loc[ev.ex_date, ev.ticker] += new - held
         log.append(
@@ -222,7 +242,7 @@ def build_positions(
                 "ratio": ev.ratio,
                 "shares_before": held,
                 "shares_after": new,
-                "fraction_paid_in_cash": round(exact - new, 6),
+                "fraction_paid_in_cash": round(max(held * ev.ratio - new, 0.0), 6),
             }
         )
     log_df = pd.DataFrame(
@@ -427,24 +447,32 @@ def _ledger_issues(
                 r.date,
             )
         )
+    # Dated at the latest offending row, so the daily job alerts when a new one lands.
     early = dividends[dividends["date"] < first_day]
     if not early.empty:
-        issues.append(Issue("WARNING", "INCOME_BEFORE_FIRST_TRADE", f"{len(early)} income rows ignored"))
-    never_held = sorted(set(dividends["ticker"]) - set(trades["ticker"]))
-    if never_held:
-        issues.append(Issue("WARNING", "INCOME_ON_UNTRADED_TICKER", ", ".join(never_held)))
+        last = early["date"].max()
+        issues.append(
+            Issue("WARNING", "INCOME_BEFORE_FIRST_TRADE", f"{len(early)} income rows ignored (latest {last.date()})", last)
+        )
+    untraded = dividends[~dividends["ticker"].isin(trades["ticker"])]
+    for tk, last in untraded.groupby("ticker")["date"].max().items():
+        issues.append(
+            Issue("WARNING", "INCOME_ON_UNTRADED_TICKER", f"{tk}: income but no trades (latest {last.date()})", last)
+        )
 
     # Auctioned fractions only exist because of a bonus / split / reverse split.
     # Fractions with no recorded event = an event the provider missed, so share
     # counts may be wrong from its ex-date (Yahoo omits some B3 bonus issues).
+    # A ratio-1 row is a rejected event (kept so the daily sync never re-adds it).
     if "type" in dividends.columns:
         kind = dividends["type"].astype(str).str.strip().str.upper()
         fractions = dividends[kind.isin(FRACTION_INCOME_TYPES)]
+        events = corporate_actions[corporate_actions["ratio"] != 1.0]
         for r in fractions.itertuples():
-            window = corporate_actions[
-                (corporate_actions["ticker"] == r.ticker)
-                & (corporate_actions["ex_date"] <= r.date)
-                & (corporate_actions["ex_date"] >= r.date - pd.Timedelta(days=FRACTION_PAYMENT_WINDOW_DAYS))
+            window = events[
+                (events["ticker"] == r.ticker)
+                & (events["ex_date"] <= r.date)
+                & (events["ex_date"] >= r.date - pd.Timedelta(days=FRACTION_PAYMENT_WINDOW_DAYS))
             ]
             if window.empty:
                 issues.append(
@@ -663,7 +691,7 @@ def average_cost_ledger(trades: pd.DataFrame, corporate_actions: pd.DataFrame | 
         if e.kind == "CA":
             if qty <= 0:
                 continue
-            qty = float(np.floor(qty * e.ratio + 1e-9))
+            qty = float(entitled_shares(qty, e.ratio))
         elif e.kind == "BUY":
             qty += e.quantity
             cost += e.total + e.fee

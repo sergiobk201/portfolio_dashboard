@@ -13,6 +13,7 @@ from portfolio_engine import (
     EngineResult,
     average_cost_ledger,
     carry_prices,
+    entitled_shares,
     implied_cash_and_contributions,
     income_quantity_reconciliation,
     normalize_corporate_actions,
@@ -198,6 +199,43 @@ def test_bonus_floors_shares_and_logs_the_cash_fraction():
     assert log["fraction_paid_in_cash"] == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize(
+    ("held", "stored_ratio", "expected"),
+    [
+        (300, 0.3333333333, 100),  # 3:1 reverse split, stored rounded down
+        (300, 0.6666666667, 200),  # 2/3, stored rounded up
+        (300, 1.3333333333, 400),  # 1-for-3 bonus
+        (900, 1.1111111111, 1000),  # 1-for-9 bonus
+        (3000, 0.0333333333, 100),  # 30:1 reverse split
+        (105, 1.1, 115),  # genuine fraction: 115.5 → 115, the 0.5 is auctioned
+        (10, 0.3333333333, 3),  # genuine fraction: 3.33 → 3
+        (100, 5.0, 500),
+    ],
+)
+def test_entitled_shares_absorbs_ratio_storage_rounding(held, stored_ratio, expected):
+    assert float(entitled_shares(held, stored_ratio)) == expected
+
+
+def test_repeating_ratio_reverse_split_keeps_every_share():
+    """300 shares through a stored 1/3 reverse split are 100, so selling 100 later is not short."""
+    t = trades_frame([(S[0], "BUY", "AAAA3", 300, 10.0), (S[2], "SELL", "AAAA3", 100, 31.0)])
+    p = prices_frame([(S[0], "AAAA3", 10.0), (S[1], "AAAA3", 30.0), (S[2], "AAAA3", 31.0)])
+    ca = actions_frame([("AAAA3", S[1], 0.3333333333)])
+    r = engine(t, p, S[2], actions=ca)
+    assert r.ok and r.positions.at[S[1], "AAAA3"] == 100 and r.positions.at[S[2], "AAAA3"] == 0
+    assert r.corporate_action_log.iloc[0]["fraction_paid_in_cash"] == 0
+    assert average_cost_ledger(t, ca).iloc[1]["quantity_after"] == 100  # the IRPF ledger agrees
+
+
+def test_income_warnings_are_dated_at_the_latest_offending_row():
+    t = trades_frame([(S[2], "BUY", "AAAA3", 100, 10.0)])
+    d = dividends_frame([(S[0], "AAAA3", 1.0), (S[3], "ZZZZ3", 2.0), (S[5], "ZZZZ3", 3.0)])
+    r = engine(t, prices_frame(flat_prices("AAAA3", 10.0, S[:6])), S[5], dividends=d)
+    dated = {i.code: (i.date, i.message) for i in r.warnings}
+    assert dated["INCOME_BEFORE_FIRST_TRADE"][0] == S[0]
+    assert dated["INCOME_ON_UNTRADED_TICKER"] == (S[5], f"ZZZZ3: income but no trades (latest {S[5].date()})")
+
+
 def test_shares_bought_on_the_ex_date_are_not_entitled():
     t = trades_frame([(S[0], "BUY", "AAAA3", 100, 10.0), (S[1], "BUY", "AAAA3", 100, 5.0)])
     p = prices_frame([(S[0], "AAAA3", 10.0), (S[1], "AAAA3", 5.0)])
@@ -271,6 +309,8 @@ def test_fractions_without_a_recorded_event_are_flagged():
     assert "FRACTIONS_WITHOUT_CORPORATE_ACTION" in codes(engine(t, p, S[5], dividends=d))
     with_event = engine(t, p, S[5], dividends=d, actions=actions_frame([("AAAA3", S[1], 1.1)]))
     assert "FRACTIONS_WITHOUT_CORPORATE_ACTION" not in codes(with_event)
+    rejected = engine(t, p, S[5], dividends=d, actions=actions_frame([("AAAA3", S[1], 1.0)]))
+    assert "FRACTIONS_WITHOUT_CORPORATE_ACTION" in codes(rejected)  # ratio 1 = an event rejected by hand
 
 
 def test_income_rows_reconcile_against_positions():

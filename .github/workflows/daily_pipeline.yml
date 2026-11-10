@@ -10,6 +10,11 @@ on:
     - cron: "30 10 * * *" # 07:30 BRT
     - cron: "30 16 * * *" # 13:30 BRT (retry)
   workflow_dispatch:
+    inputs:
+      all_warnings:
+        description: Also send every open engine warning to Telegram
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,7 +99,8 @@ jobs:
           cache: pip
           cache-dependency-path: prices_requirements.txt
       - run: pip install -r prices_requirements.txt
-      - run: python pipelines/calculate_daily_twr.py
+      # inputs is empty on a schedule, so only a manual run lists every warning.
+      - run: python pipelines/calculate_daily_twr.py ${{ inputs.all_warnings && '--all-warnings' || '' }}
 
   notify-failure:
     # The scripts alert on data problems themselves. This covers a red job they
