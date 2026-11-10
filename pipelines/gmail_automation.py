@@ -7,7 +7,9 @@ Monthly trade import: every Rico nota de corretagem e-mailed in the last N days
 Each nota runs the full pipeline on fresh state with a fresh database read, so
 it sees what the nota before it just loaded, and the duplicate check
 (ledger_dedupe) skips notas already in the table: re-runs and overlapping
-windows are safe. The batch stops at the first nota that fails.
+windows are safe. Before any database read, every nota — loaded before or
+not — must reconcile to the cent with its own printed purchases and sales.
+The batch stops at the first nota that fails.
 
 Usage: python pipelines/gmail_automation.py [--days N] [--keep-pdfs]
 """
@@ -36,6 +38,7 @@ import numpy as np
 from typing import Any, Sequence, Union
 import re
 import psycopg2
+import unicodedata
 import uuid
 from typing import Set
 from io import StringIO
@@ -44,7 +47,8 @@ import yfinance as yf
 from google.auth.exceptions import GoogleAuthError, RefreshError
 
 from ledger_dedupe import TRADE_KEY, LedgerUnavailableError, plan_idempotent_load
-from nota_fees import cblc_fees, extract_dc_flag
+from nota_fees import cblc_fees, check_fee_cap, extract_dc_flag
+from prompts import ask, portfolio_name
 
 try:  # yfinance ≥ 0.2.50 exposes a typed exception hierarchy
     from yfinance.exceptions import YFException
@@ -285,6 +289,22 @@ TRADE_LINE = re.compile(r"^1-BOVESPA.*$", flags=re.MULTILINE)
 NOTA_COLUMNS = ["market", "side", "type", "asset", "quantity", "price", "total"]
 # Share count: plain digits, or digits with a thousands dot ("1.000").
 QUANTITY_TOKEN = re.compile(r"\d{1,3}(?:\.\d{3})+|\d+")
+# Price / value: Brazilian decimal ("12,34", "1.234,56").
+AMOUNT_TOKEN = re.compile(r"\d+(?:\.\d{3})*,\d+")
+# Cash-market buys and sells only: a termo or options line stops the nota.
+CASH_MARKETS = {"VISTA", "FRACIONARIO", "FRACIONÁRIO"}
+SIDES = {"C", "V"}
+DATE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+# "Resumo dos Negócios": the nota's own gross cash-market purchases and sales.
+PRINTED_TOTALS = {
+    "C": ("Compras à vista", re.compile(r"Compras\s+[àa]\s+vista\s+([\d.,]+)")),
+    "V": ("Vendas à vista", re.compile(r"Vendas\s+[àa]\s+vista\s+([\d.,]+)")),
+}
+# Labels only a Bovespa nota prints (an informe or a BM&F nota has none of them).
+BOVESPA_SECTION = re.compile(r"Total\s+CBLC|Total\s+Bovespa|Compras\s+[àa]\s+vista|Vendas\s+[àa]\s+vista")
+# B3 code: a 4-character root (letters; B3SA3 and some BDRs carry a digit) and
+# 1–2 digits. A fractional-market F suffix maps to the round-lot code.
+B3_TICKER = re.compile(r"([A-Z][A-Z0-9]{3}\d{1,2})F?")
 
 
 def br_number(token: str) -> float:
@@ -296,13 +316,21 @@ def br_number(token: str) -> float:
     return float(token.replace(".", "").replace(",", "."))
 
 
+def br_money(value: float) -> str:
+    """1234.5 → '1.234,50', as the nota prints it."""
+    return f"{value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
 def parse_trade_lines(text: str) -> pd.DataFrame:
     """'1-BOVESPA' lines of a nota → one row per trade (Brazilian number format).
 
-    Each line must reconcile on its own: quantity × price = total, within the
-    rounding of a price printed to the cent. A line read with the wrong anchor
-    (a new layout, a termo or options line) stops the nota instead of loading
-    a wrong trade into the tax ledger.
+    Quantity, price and value are read from the right: they are the line's
+    last quantity / price / value triple (only the D/C flag follows), so an
+    observation code ('2', '8') or a number in the asset name is never taken
+    for the quantity. Each line must reconcile on its own (quantity × price =
+    total, within the rounding of a price printed to the cent) and be a
+    cash-market buy or sell: a termo or options line stops the nota instead of
+    loading a wrong trade into the tax ledger.
 
     Args:
         text: Nota text.
@@ -311,23 +339,33 @@ def parse_trade_lines(text: str) -> pd.DataFrame:
         NOTA_COLUMNS frame; empty when the text has no Bovespa lines.
 
     Raises:
-        ValueError: A line has no quantity / price / total columns, or its
-            numbers do not reconcile.
+        ValueError: A line has no quantity / price / total columns, is not a
+            cash-market buy or sell, or its numbers do not reconcile.
     """
     records = []
     for n, line in enumerate(TRADE_LINE.findall(text), start=1):
         parts = line.split()
 
-        market = parts[0]  # 1-BOVESPA
-        side = parts[1]  # C or V
-        tipo = parts[2]  # FRACIONARIO, VISTA, etc.
-
-        # Quantity is the first integer token after the description and its
-        # observation marker (e.g. '@'); price and total follow it.
-        index = next((i for i in range(3, len(parts)) if QUANTITY_TOKEN.fullmatch(parts[i])), None)
-        if index is None or index + 2 >= len(parts):
+        index = next(
+            (
+                i
+                for i in range(len(parts) - 3, 2, -1)
+                if QUANTITY_TOKEN.fullmatch(parts[i])
+                and AMOUNT_TOKEN.fullmatch(parts[i + 1])
+                and AMOUNT_TOKEN.fullmatch(parts[i + 2])
+            ),
+            None,
+        )
+        if index is None:
             raise ValueError(f"trade line {n}: no quantity / price / total columns — nota layout changed?")
+        market, side, tipo = parts[:3]  # 1-BOVESPA, C or V, VISTA / FRACIONARIO
+        if side not in SIDES or tipo not in CASH_MARKETS:
+            raise ValueError(f"trade line {n}: '{side} {tipo}' is not a cash-market buy or sell (termo, options?)")
+        # The token before the quantity is the observation column (e.g. '@'),
+        # left out of the name exactly as the stored asset names were built.
         description = " ".join(parts[3 : index - 1])
+        if not description:
+            raise ValueError(f"trade line {n}: no asset name before the quantity — nota layout changed?")
 
         quantity = int(parts[index].replace(".", ""))
         raw_price = br_number(parts[index + 1])
@@ -349,6 +387,83 @@ def parse_trade_lines(text: str) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(records, columns=NOTA_COLUMNS)
+
+
+def trading_day(text: str) -> str:
+    """The nota's trading day (dd/mm/yyyy): its first date, which every trade line must fall under.
+
+    The first date is the header's "Data pregão" — the date every loaded trade
+    carries, so re-runs keep matching them. A line falls under the last date
+    printed above it (its page header); a line under any other date belongs to
+    a second nota in the same PDF, which must not load under the first's day.
+
+    Args:
+        text: Nota text with at least one trade line.
+
+    Raises:
+        ValueError: A trade line has no date above it, or the PDF spans more
+            than one trading day.
+    """
+    dates = list(DATE.finditer(text))
+    above = np.searchsorted([m.start() for m in dates], [m.start() for m in TRADE_LINE.finditer(text)]) - 1
+    if (above < 0).any():
+        raise ValueError("a trade line has no trading day (dd/mm/yyyy) above it — nota layout changed?")
+    days = list(dict.fromkeys([dates[0].group(), *(dates[i].group() for i in above)]))
+    if len(days) > 1:
+        raise ValueError(
+            f"the PDF spans {len(days)} trading days ({', '.join(days)}) — one nota (pregão) per PDF expected. "
+            "Nothing loaded."
+        )
+    return days[0]
+
+
+def reconcile_with_summary(text: str, lines: pd.DataFrame, nota: str) -> None:
+    """Check the trade lines against the nota's printed "Resumo dos Negócios", to the cent.
+
+    A per-line check cannot see a line the parser missed; the nota's own totals
+    can: its gross cash-market purchases and sales must equal the C and V lines.
+
+    Args:
+        text: Nota text.
+        lines: parse_trade_lines output.
+        nota: Trading day, naming the nota in the message.
+
+    Raises:
+        ValueError: A printed total is missing (layout change) or differs from
+            the lines.
+    """
+    text = unicodedata.normalize("NFC", text)  # 'à' may be extracted decomposed
+    cents = (lines["total"] * 100).round().astype("int64").groupby(lines["side"]).sum()
+    for side, (label, pattern) in PRINTED_TOTALS.items():
+        match = pattern.search(text)
+        if match is None:
+            raise ValueError(f"nota {nota}: no printed '{label}' total — nota layout changed? Nothing loaded.")
+        printed = round(br_number(match.group(1)) * 100)
+        parsed = int(cents.get(side, 0))
+        if parsed != printed:
+            raise ValueError(
+                f"nota {nota}: trade lines add up to {br_money(parsed / 100)} but '{label}' prints "
+                f"{br_money(printed / 100)} — a trade line was missed or misread. Nothing loaded."
+            )
+
+
+def b3_ticker(answer: str) -> str | None:
+    """Round-lot B3 ticker from a typed answer ('petr4f ' → 'PETR4'), or None if invalid."""
+    match = B3_TICKER.fullmatch(answer.strip().upper())
+    return match.group(1) if match else None
+
+
+def copy_csv(cursor: Any, table: str, frame: pd.DataFrame) -> None:
+    """Bulk-insert ``frame`` into ``table`` with COPY in CSV format.
+
+    COPY's default text format ignores CSV quoting, so a quoted value holding
+    a comma (the Yahoo industry "Furnishings, Fixtures & Appliances") would
+    split into an extra column. Table and column names come from this module.
+    """
+    buffer = StringIO()
+    frame.to_csv(buffer, header=False, index=False)
+    buffer.seek(0)
+    cursor.copy_expert(f"COPY {table} ({', '.join(frame.columns)}) FROM STDIN WITH (FORMAT csv)", buffer)
 
 
 def iso_day(text: str | None) -> str:
@@ -375,20 +490,31 @@ class GmailRicoImporter:
         self.inserted = 0
         self.db_trades_df = pd.DataFrame()
         self.db_assets_df = pd.DataFrame()
+        self.new_assets = pd.DataFrame()  # tickers to register, inserted with the trades
 
     def run_pipeline(self) -> int:
         """Load this nota's new trades; return how many rows were inserted.
 
         The encrypted and decrypted PDFs are deleted afterwards, also on
         failure, unless ``keep_pdfs``.
+
+        Raises:
+            ValueError: A Bovespa nota with no recognised trade line, or one
+                that does not reconcile with its own printed totals.
         """
         try:
             self.final_pdf()
             self.read_pdf()
             if self.df.empty:
-                print("⚠️ No '1-BOVESPA' lines — not a Bovespa nota, or the layout changed. Nothing loaded.")
+                if BOVESPA_SECTION.search(unicodedata.normalize("NFC", self.full_text)):
+                    raise ValueError(
+                        "the nota prints a Bovespa summary but no '1-BOVESPA' line was recognised — "
+                        "nota layout changed? Nothing loaded."
+                    )
+                print("⚠️ No '1-BOVESPA' lines and no Bovespa summary — not a trade nota (informe, BM&F?). Skipped.")
                 return 0
             self.extract_fees()
+            self.reconcile()  # the nota against itself, before any read or write
             self.add_data_to_df()
             self.get_trades_table()  # fresh read: includes the nota loaded just before this one
             self.get_assets_table()
@@ -457,6 +583,19 @@ class GmailRicoImporter:
         self.df = parse_trade_lines(self.full_text)
         self.lines = len(self.df)
 
+    def reconcile(self) -> None:
+        """Check the nota against its own printout: one trading day, totals to the cent.
+
+        Runs on every nota, already loaded or not, so a re-run proves each
+        nota before the duplicate check skips it.
+
+        Raises:
+            ValueError: The PDF spans several trading days, or the trade lines
+                miss the printed purchases / sales (or those are not printed).
+        """
+        self.trade_date = trading_day(self.full_text)
+        reconcile_with_summary(self.full_text, self.df, self.trade_date)
+
     def extract_single_value(self, label, text):
         pattern = rf"{label}\s+([\d\.,]+)"
         match = re.search(pattern, text)
@@ -500,12 +639,11 @@ class GmailRicoImporter:
         return match.group(1) if match else None
 
     def add_data_to_df(self):
+        """Spread the nota's costs over its lines (trading day set by reconcile).
 
-        trade_date = self.extract_first_date(self.full_text)
-        if trade_date is None:
-            raise ValueError("no trading day (dd/mm/yyyy) in the nota text")
-        self.trade_date = trade_date
-
+        Raises:
+            ValueError: The cost block implies negative or implausibly high fees.
+        """
         total_trade_volume = self.df["total"].sum()
         buys = float(self.df.loc[self.df["side"] == "C", "total"].sum())
         sells = float(self.df.loc[self.df["side"] == "V", "total"].sum())
@@ -513,6 +651,7 @@ class GmailRicoImporter:
             cblc_fees(self.total_cblc, self.cblc_flag, buys, sells) + self.total_custos + self.total_bovespa,
             2,
         )
+        check_fee_cap(total_fees, float(total_trade_volume))  # the cost block is outside reconciliation
 
         # Pro-rata by trade value: each trade carries its share of the note's costs.
         self.df["fee"] = round(self.df["total"] / total_trade_volume * total_fees, 2)
@@ -677,26 +816,13 @@ class GmailRicoImporter:
                 # --- PRIORITY 3: ADD TO MANUAL LIST ---
                 assets_requiring_manual_input.append(asset_name)
 
-        # --- STEP 3: MANUAL INPUT ---
+        # --- STEP 3: MANUAL INPUT --- (EOFError stops the nota before any write)
         if assets_requiring_manual_input:
             print("\n--- MANUAL TICKER INPUT REQUIRED ---")
             for asset in assets_requiring_manual_input:
-                try:
-                    new_ticker = input(f"Enter ticker for '{asset}': ")
-                    if new_ticker.strip():
-                        ticker_val = new_ticker.strip().upper()
-                        df_copy.loc[df_copy[asset_column] == asset, ticker_column] = (
-                            ticker_val
-                        )
-                        print(f"✅ Ticker '{ticker_val}' assigned to '{asset}'.")
-                    else:
-                        df_copy.loc[df_copy[asset_column] == asset, ticker_column] = (
-                            UNRESOLVED_PLACEHOLDER
-                        )
-                except EOFError:
-                    df_copy.loc[df_copy[asset_column] == asset, ticker_column] = (
-                        UNRESOLVED_PLACEHOLDER
-                    )
+                ticker_val = ask(f"Enter ticker for '{asset}': ", b3_ticker, "a B3 ticker such as ABCD3 or ABCD11")
+                df_copy.loc[df_copy[asset_column] == asset, ticker_column] = ticker_val
+                print(f"✅ Ticker '{ticker_val}' assigned to '{asset}'.")
 
         print("----------------------------------\n")
         return df_copy
@@ -796,19 +922,11 @@ class GmailRicoImporter:
 
         print(f"--- {len(unresolved_indices)} Trades still require MANUAL INPUT ---")
 
-        for idx in unresolved_indices:
+        for idx in unresolved_indices:  # EOFError stops the nota before any write
             asset_name = df_copy.loc[idx, asset_column]
-            try:
-                new_portfolio = input(f"[{idx}] Enter Portfolio for '{asset_name}': ")
-                if new_portfolio.strip():
-                    df_copy.loc[idx, portfolio_column] = new_portfolio.strip().upper()
-                    print(
-                        f"✅ Assigned '{new_portfolio.strip().upper()}' to '{asset_name}'."
-                    )
-                else:
-                    df_copy.loc[idx, portfolio_column] = UNRESOLVED_PLACEHOLDER
-            except EOFError:
-                df_copy.loc[idx, portfolio_column] = UNRESOLVED_PLACEHOLDER
+            portfolio = ask(f"[{idx}] Enter Portfolio for '{asset_name}': ", portfolio_name, "a portfolio name")
+            df_copy.loc[idx, portfolio_column] = portfolio
+            print(f"✅ Assigned '{portfolio}' to '{asset_name}'.")
 
         return df_copy
 
@@ -893,6 +1011,12 @@ class GmailRicoImporter:
         self.df = self.df[final_order]
 
     def resolve_assets_with_db(self):
+        """Collect the nota's tickers missing from `assets` into ``new_assets``.
+
+        Nothing is written here: load_to_db inserts them in the same
+        transaction as the trades, so a nota that stops later (a prompt left
+        unanswered, a failed insert) leaves no orphan asset behind.
+        """
         print("--- Checking assets table ---")
 
         current_tickers = set(self.df["ticker"].unique())
@@ -933,53 +1057,17 @@ class GmailRicoImporter:
                 }
             )
 
-        if new_assets:
-            new_assets_df = pd.DataFrame(new_assets)
-            buffer_asset = StringIO()
-            new_assets_df.to_csv(buffer_asset, header=False, index=False)
-            buffer_asset.seek(0)
-
-            assets_columns = new_assets_df.columns.to_list()
-
-            connection = None
-            try:
-                connection = psycopg2.connect(
-                    host=DB_HOST,
-                    database=DB_NAME,
-                    user=DB_USER,
-                    password=DB_PASSWORD,
-                    port=DB_PORT,
-                )
-
-                with connection.cursor() as cur:
-                    cur.copy_from(
-                        file=buffer_asset,
-                        table="assets",
-                        sep=",",
-                        columns=assets_columns,
-                    )
-
-                    connection.commit()
-                    print(
-                        f"Successfully inserted {len(new_assets_df)} rows into assets table"
-                    )
-
-            except psycopg2.Error as e:
-                if connection:
-                    connection.rollback()
-                print(f"Database error: {e}")
-
-            finally:
-                if connection:
-                    connection.close()
+        self.new_assets = pd.DataFrame(new_assets, columns=["ticker", "company_name", "sector", "industry"])
 
     def load_to_db(self):
-        buffer = StringIO()
-        self.df.to_csv(buffer, header=False, index=False)
+        """Insert the nota's new assets and its trades in ONE transaction.
 
-        buffer.seek(0)
+        Both land or neither does: a failed insert rolls back and re-raises,
+        so the nota is reported FAILED and a re-run starts clean.
 
-        columns = self.df.columns.to_list()
+        Raises:
+            psycopg2.Error: The connection or an insert failed (rolled back).
+        """
         connection = None
         try:
             # 1. Establish the connection
@@ -992,10 +1080,12 @@ class GmailRicoImporter:
             )
 
             with connection.cursor() as cur:
-                cur.copy_from(file=buffer, table="trades", sep=",", columns=columns)
+                if not self.new_assets.empty:
+                    copy_csv(cur, "assets", self.new_assets)
+                copy_csv(cur, "trades", self.df)
 
                 connection.commit()
-                print(f"Successfully inserted {len(self.df)} rows into trades table")
+                print(f"Successfully inserted {len(self.new_assets)} asset(s) and {len(self.df)} trade(s)")
 
         except psycopg2.Error as e:
             if connection:

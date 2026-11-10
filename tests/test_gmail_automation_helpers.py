@@ -1,4 +1,4 @@
-"""Nota importer (gmail_automation.py): Gmail batch loop, re-run guard and wiring.
+"""Nota importer (gmail_automation.py): Gmail batch loop, reconciliation, prompts, re-run guard and wiring.
 
 The real importer runs end to end against in-memory fakes: a Gmail service,
 the trades/assets tables, and "PDFs" whose decrypted text is the synthetic nota
@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ast
 import base64
+import csv
 import datetime as dt
 import importlib.util
+import re
 import sys
 import types
 import warnings
@@ -79,16 +81,57 @@ def br(value: float) -> str:
     return f"{value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 
-def nota_text(day: str, *lines: tuple[str, str, int, float], costs: bool = True) -> str:
-    """Synthetic nota: trading day, '1-BOVESPA' lines and a CBLC block consistent with them."""
+def dc(value: float) -> str:
+    """Sinacor D/C flag of a signed amount (debit positive)."""
+    return "D" if value >= 0 else "C"
+
+
+def nota_text(day: str, *lines: tuple[str, str, int, float], costs: bool = True, summary: bool = True) -> str:
+    """Synthetic Sinacor nota as pdfplumber extracts it, every figure consistent with its lines.
+
+    Header with the trading day, '1-BOVESPA' lines, then the bottom block:
+    "Resumo dos Negócios" (left) and "Resumo Financeiro" (right) merged line by
+    line, ending with the settlement-day "Líquido para" line.
+
+    Args:
+        day: Trading day, dd/mm/yyyy.
+        lines: (side, asset, quantity, price) per trade line.
+        costs: False drops the whole bottom block.
+        summary: False drops only the "Resumo dos Negócios" column (a layout change).
+    """
     body = [
         f"1-BOVESPA {side} VISTA {asset} @ {qty} {br(price)} {br(qty * price)} {'D' if side == 'C' else 'C'}"
         for side, asset, qty, price in lines
     ]
-    net = sum(round(qty * price, 2) * (1 if side == "C" else -1) for side, _, qty, price in lines)
-    cblc, flag = (net + 0.25, "D") if net >= 0 else (-net - 0.25, "C")
-    block = [f"Total CBLC {br(cblc)} {flag}", "Total Bovespa / Soma 0,04", "Total Custos / Despesas 0,00"]
-    return "\n".join(["NOTA DE CORRETAGEM", f"Data pregão {day}", *body, *(block if costs else [])]) + "\n"
+    buys = round(sum(round(qty * price, 2) for side, _, qty, price in lines if side == "C"), 2)
+    sells = round(sum(round(qty * price, 2) for side, _, qty, price in lines if side == "V"), 2)
+    net = round(buys - sells, 2)
+    cblc = round(net + 0.25, 2)  # net + taxa de liquidação, debit positive
+    net_cash = round(cblc + 0.04, 2)  # + emolumentos
+    settle = (dt.datetime.strptime(day, "%d/%m/%Y") + dt.timedelta(days=2)).strftime("%d/%m/%Y")
+    rows = [
+        ("Resumo dos Negócios", "Resumo Financeiro"),
+        ("Debêntures 0,00", "Clearing"),
+        (f"Vendas à vista {br(sells)}", f"Valor líquido das operações {br(abs(net))} {dc(net)}"),
+        (f"Compras à vista {br(buys)}", "Taxa de liquidação 0,25 D"),
+        ("Opções - compras 0,00", "Taxa de Registro 0,00 D"),
+        ("Opções - vendas 0,00", f"Total CBLC {br(abs(cblc))} {dc(cblc)}"),
+        ("Operações à termo 0,00", "Bolsa"),
+        (f"Valor das operações {br(buys + sells)}", "Emolumentos 0,04 D"),
+        ("", "Total Bovespa / Soma 0,04 D"),
+        ("", "Total Custos / Despesas 0,00 D"),
+        ("", f"Líquido para {settle} {br(abs(net_cash))} {dc(net_cash)}"),
+    ]
+    block = [f"{left if summary else ''} {right}".strip() for left, right in rows] if costs else []
+    header = [
+        "NOTA DE CORRETAGEM",
+        "Nr. nota Folha Data pregão",
+        f"123456 1 {day}",
+        "Negócios realizados",
+        "Q Negociação C/V Tipo mercado Prazo Especificação do título Obs. (*) Quantidade Preço / Ajuste "
+        "Valor Operação / Ajuste D/C",
+    ]
+    return "\n".join([*header, *body, *block]) + "\n"
 
 
 BUY_A = ("C", "AAAA ON", 100, 12.34)
@@ -167,7 +210,11 @@ class FakeGmail:
 
 
 class FakeDB:
-    """trades + assets held in memory behind psycopg2.connect / pandas.read_sql_query."""
+    """trades + assets held in memory behind psycopg2.connect / pandas.read_sql_query.
+
+    Like Postgres, COPY rows stay pending until commit (rollback or close
+    discards them), and every row must carry exactly one field per column.
+    """
 
     SEEDED = 3
 
@@ -188,6 +235,8 @@ class FakeDB:
         )
         self.assets = pd.DataFrame({"ticker": ["AAAA3", "BBBB4", "CCCC3"], "company_name": ["A", "B", "C"]})
         self.fail_insert = self.fail_read = False
+        self.fail_table: str | None = None  # COPY into this table fails
+        self.pending: list[tuple[str, pd.DataFrame]] = []
         self.commits = self.rollbacks = 0
 
     @property
@@ -208,19 +257,33 @@ class FakeDB:
         return None
 
     def commit(self) -> None:
+        for table, rows in self.pending:
+            setattr(self, table, pd.concat([getattr(self, table).astype(str), rows], ignore_index=True))
+        self.pending.clear()
         self.commits += 1
 
     def rollback(self) -> None:
+        self.pending.clear()
         self.rollbacks += 1
 
     def close(self) -> None:
-        return None
+        self.pending.clear()  # uncommitted rows die with the connection
 
-    def copy_from(self, file, table: str, sep: str, columns: list[str]) -> None:
-        if self.fail_insert:
+    def _stage(self, table: str, columns: list[str], rows: list[list[str]]) -> None:
+        if self.fail_insert or self.fail_table == table:
             raise psycopg2.OperationalError("server closed the connection unexpectedly")
-        rows = pd.read_csv(file, sep=sep, header=None, names=columns, dtype=str)
-        setattr(self, table, pd.concat([getattr(self, table).astype(str), rows], ignore_index=True))
+        if any(len(row) != len(columns) for row in rows):
+            raise psycopg2.DataError(f"COPY {table}: extra data after last expected column")
+        self.pending.append((table, pd.DataFrame(rows, columns=columns, dtype=str)))
+
+    def copy_expert(self, sql: str, file) -> None:
+        match = re.fullmatch(r"COPY (\w+) \((\w+(?:, \w+)*)\) FROM STDIN WITH \(FORMAT csv\)", sql)
+        assert match, f"unexpected COPY statement: {sql}"
+        self._stage(match[1], match[2].split(", "), list(csv.reader(file)))
+
+    def copy_from(self, file, table: str, sep: str = "\t", columns: list[str] | None = None, **_: object) -> None:
+        """Text-format COPY, as copy_from sends it: no CSV quoting, every separator splits."""
+        self._stage(table, list(columns or []), [line.split(sep) for line in file.read().splitlines()])
 
     def read_sql_query(self, sql: str, _connection: object) -> pd.DataFrame:
         if self.fail_read:
@@ -408,6 +471,164 @@ def test_e_mails_without_trades_are_reported_and_the_batch_continues(db: FakeDB,
     assert db.loaded["ticker"].tolist() == ["AAAA3"]
 
 
+# ── the nota against its own printout ──────────────────────────────────────
+
+
+def import_one(text: str, folder: Path) -> gm.NotaResult:
+    """Run one e-mailed nota through the batch loop; return its result."""
+    (result,) = gm.import_notas(FakeGmail().add("m-1", "2025-03-10 18:00", text), attachments_dir=folder)
+    return result
+
+
+def test_a_missed_trade_line_fails_the_nota_and_names_both_figures(db: FakeDB, tmp_path: Path):
+    # The FILL_C line is printed (and in "Compras à vista") but not recognised.
+    text = nota_text("10/03/2025", BUY_A, FILL_C).replace("1-BOVESPA C VISTA CCCC", " 1-BOVESPA C VISTA CCCC")
+    result = import_one(text, tmp_path)
+    assert (result.trade_date, result.status) == ("2025-03-10", gm.FAILED)
+    assert (
+        "nota 10/03/2025: trade lines add up to 1.234,00 but 'Compras à vista' prints 1.254,00 — "
+        "a trade line was missed or misread. Nothing loaded."
+    ) in result.error
+    assert db.loaded.empty and db.commits == 0
+
+
+def test_totals_must_match_to_the_cent_on_each_side():
+    text = nota_text("10/03/2025", BUY_A, SELL_B)
+    lines = gm.parse_trade_lines(text)
+    gm.reconcile_with_summary(text, lines, "10/03/2025")  # consistent: no error
+    with pytest.raises(ValueError, match="add up to 430,50 but 'Vendas à vista' prints 430,51"):
+        gm.reconcile_with_summary(text.replace("Vendas à vista 430,50", "Vendas à vista 430,51"), lines, "10/03/2025")
+    decomposed = text.replace("Compras à vista", "Compras à vista")  # 'à' extracted as a + combining grave
+    gm.reconcile_with_summary(decomposed, lines, "10/03/2025")
+
+
+def test_missing_printed_totals_fail_as_a_layout_change(db: FakeDB, tmp_path: Path):
+    result = import_one(nota_text("10/03/2025", BUY_A, summary=False), tmp_path)
+    assert result.status == gm.FAILED
+    assert "nota 10/03/2025: no printed 'Compras à vista' total — nota layout changed? Nothing loaded." in result.error
+    assert db.loaded.empty
+
+
+@pytest.mark.parametrize(
+    ("text", "days"),
+    [
+        (nota_text("10/03/2025", BUY_A) + nota_text("11/03/2025", SELL_B), "10/03/2025, 11/03/2025"),
+        # A trade-less (BM&F) nota ahead of the Bovespa one: its date must not date the trades.
+        ("NOTA DE CORRETAGEM\nData pregão 07/03/2025\nC WDO F25 1 5.000,000 DAY TRADE\n" + nota_text("10/03/2025", BUY_A),
+         "07/03/2025, 10/03/2025"),
+    ],
+)
+def test_a_pdf_spanning_two_trading_days_fails(db: FakeDB, tmp_path: Path, text: str, days: str):
+    result = import_one(text, tmp_path)
+    assert result.status == gm.FAILED and f"the PDF spans 2 trading days ({days})" in result.error
+    assert db.loaded.empty
+
+
+def test_a_multi_page_nota_repeats_its_header_and_loads_under_one_day(db: FakeDB, tmp_path: Path):
+    page_break = "Líquido para 12/03/2025 CONTINUA...\nNOTA DE CORRETAGEM\nNr. nota Folha Data pregão\n123456 2 10/03/2025\n"
+    text = nota_text("10/03/2025", BUY_A, SELL_B).replace("1-BOVESPA V", page_break + "1-BOVESPA V")
+    result = import_one(text, tmp_path)
+    assert (result.trade_date, result.status, result.inserted) == ("2025-03-10", gm.LOADED, 2)
+
+
+def test_a_rerun_reconciles_every_nota_before_skipping_it(db: FakeDB, tmp_path: Path):
+    text = nota_text("10/03/2025", BUY_A, SELL_B)
+    assert import_one(text, tmp_path).status == gm.LOADED
+    rerun = import_one(text, tmp_path)
+    assert (rerun.status, rerun.inserted, rerun.skipped) == (gm.ALREADY_LOADED, 0, 2)
+    misread = import_one(text.replace("Vendas à vista 430,50", "Vendas à vista 430,51"), tmp_path)
+    assert misread.status == gm.FAILED and "'Vendas à vista' prints 430,51" in misread.error
+    assert len(db.loaded) == 2 and db.commits == 1
+
+
+def test_a_bovespa_nota_with_no_recognised_line_fails_instead_of_no_trades(db: FakeDB, tmp_path: Path):
+    text = nota_text("10/03/2025", BUY_A).replace("1-BOVESPA", "1-B3")  # a renamed market column
+    result = import_one(text, tmp_path)
+    assert result.status == gm.FAILED
+    assert "prints a Bovespa summary but no '1-BOVESPA' line was recognised" in result.error
+    assert gm.BOVESPA_SECTION.search("INFORME DE RENDIMENTOS 2024") is None  # stays NO_TRADES (test above)
+
+
+def test_implausible_costs_fail_the_nota(db: FakeDB, tmp_path: Path):
+    # A sell nota whose CBLC credit is read as a debit: fees ≈ twice the proceeds.
+    text = nota_text("10/03/2025", SELL_B).replace("Total CBLC 430,25 C", "Total CBLC 430,25 D")
+    result = import_one(text, tmp_path)
+    assert result.status == gm.FAILED and "nota costs 860.79 exceed the 14.30 cap" in result.error
+    assert db.loaded.empty
+
+
+# ── prompts and the single write ───────────────────────────────────────────
+
+NEW_D = ("C", "DDDD ON", 10, 5.00)  # an asset the ledger has never seen
+
+
+def scripted_input(monkeypatch: pytest.MonkeyPatch, *answers: str) -> list[str]:
+    """Answer prompts in order, then behave like a closed stdin; return the prompts shown."""
+    queue, prompts = list(answers), []
+
+    def fake(prompt: str = "") -> str:
+        prompts.append(prompt)
+        if not queue:
+            raise EOFError
+        return queue.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake)
+    return prompts
+
+
+@pytest.fixture
+def yahoo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sector / industry lookup; the industry holds a comma, as Yahoo's often do."""
+    info = {"sector": "Consumer Cyclical", "industry": "Furnishings, Fixtures & Appliances"}
+    monkeypatch.setattr(gm.yf, "Ticker", lambda _symbol: types.SimpleNamespace(info=info))
+
+
+def test_a_new_asset_reprompts_until_a_valid_ticker_and_lands_with_its_trade(
+    db: FakeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yahoo: None
+):
+    prompts = scripted_input(monkeypatch, "", "dddd", "DDDD ON", " dddd3f ", "gamma")
+    result = import_one(nota_text("10/03/2025", NEW_D), tmp_path)
+    assert result.status == gm.LOADED
+    assert prompts == ["Enter ticker for 'DDDD ON': "] * 4 + ["[0] Enter Portfolio for 'DDDD3': "]
+    assert db.loaded[["ticker", "portfolio"]].values.tolist() == [["DDDD3", "GAMMA"]]  # F suffix → round lot
+    assert db.assets.iloc[-1].tolist() == ["DDDD3", "DDDD ON", "Consumer Cyclical", "Furnishings, Fixtures & Appliances"]
+    assert db.commits == 1  # assets and trades in one transaction
+
+
+@pytest.mark.parametrize("answers", [(), ("DDDD3",)], ids=["eof-at-ticker", "eof-at-portfolio"])
+def test_a_closed_stdin_stops_the_nota_with_nothing_saved(
+    db: FakeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yahoo: None, answers: tuple[str, ...]
+):
+    scripted_input(monkeypatch, *answers)
+    result = import_one(nota_text("10/03/2025", NEW_D), tmp_path)
+    assert result.status == gm.FAILED
+    assert result.error.startswith("EOFError: no answer to") and "nothing saved" in result.error
+    assert db.loaded.empty and len(db.assets) == 3 and db.commits == 0
+    assert not db.trades.isin([gm.UNRESOLVED_PLACEHOLDER]).any().any()
+
+
+@pytest.mark.parametrize("failing", ["assets", "trades"])
+def test_a_failed_insert_saves_neither_assets_nor_trades(
+    db: FakeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yahoo: None, failing: str
+):
+    scripted_input(monkeypatch, "DDDD3", "GAMMA")
+    db.fail_table = failing
+    result = import_one(nota_text("10/03/2025", NEW_D), tmp_path)
+    assert result.status == gm.FAILED and "OperationalError" in result.error  # re-raised, not printed
+    assert db.loaded.empty and len(db.assets) == 3 and (db.commits, db.rollbacks) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("answer", "ticker"),
+    [("abcd3", "ABCD3"), (" ABCD11 ", "ABCD11"), ("abcd4f", "ABCD4"), ("ABCD11F", "ABCD11"),
+     ("A1BC3", "A1BC3"), ("ABCD34", "ABCD34"),  # a digit in the root, BDR suffix
+     ("", None), ("ABCD", None), ("ABC3", None), ("ABCDE3", None), ("ABCD123", None), ("1ABC3", None),
+     ("ABCD3.SA", None), ("ABCD 3", None), ("ABCD ON", None)],
+)
+def test_b3_ticker_answers(answer: str, ticker: str | None):
+    assert gm.b3_ticker(answer) == ticker
+
+
 def test_cli_options():
     assert (gm.parse_args([]).days, gm.parse_args([]).keep_pdfs) == (45, False)
     args = gm.parse_args(["--days", "10", "--keep-pdfs"])
@@ -451,14 +672,31 @@ def test_an_averaged_price_within_a_cent_reconciles():
 @pytest.mark.parametrize(
     "line",
     [
-        "1-BOVESPA C TERMO FFFF ON 30 100 12,00 1.200,00 D",  # termo: the prazo is read as the quantity
+        "1-BOVESPA C TERMO FFFF ON 30 100 12,00 1.200,00 D",  # termo: not a cash-market trade
+        "1-BOVESPA C OPCAO DE COMPRA 03/25 FFFFC120 ON 12,00 @ 100 0,50 50,00 D",  # options
         "1-BOVESPA C VISTA GGGG ON @ 100 12,00 120,00 D",  # total disagrees with quantity × price
         "1-BOVESPA C VISTA HHHH ON @ 1.000,00 D",  # no quantity column at all
+        "1-BOVESPA C VISTA @ 100 12,00 1.200,00 D",  # no asset name
     ],
 )
 def test_a_line_that_does_not_reconcile_stops_the_nota(line: str):
     with pytest.raises(ValueError, match="trade line 1"):
         gm.parse_trade_lines(line + "\n")
+
+
+@pytest.mark.parametrize(
+    ("line", "asset", "quantity"),
+    [
+        ("1-BOVESPA C VISTA DDDD ON 2 100 12,00 1.200,00 D", "DDDD ON", 100),  # observation code '2'
+        ("1-BOVESPA V VISTA DDDD ON NM 8 1.000 1,20 1.200,00 C", "DDDD ON NM", 1000),  # '8', thousands dot
+        ("1-BOVESPA C VISTA DDDD 11 CI @ 10 120,00 1.200,00 D", "DDDD 11 CI", 10),  # a number in the name
+        ("1-BOVESPA C FRACIONARIO DDDD11 CI ER # 3 400,00 1.200,00 D", "DDDD11 CI ER", 3),
+    ],
+)
+def test_quantity_price_and_total_are_read_from_the_right(line: str, asset: str, quantity: int):
+    out = gm.parse_trade_lines(line + "\n")
+    assert out[["asset", "quantity"]].values.tolist() == [[asset, quantity]]
+    assert out["total"].tolist() == pytest.approx([1200.0])
 
 
 # ── duplicate guard on importer-shaped frames ──────────────────────────────
@@ -574,3 +812,13 @@ def test_duplicate_check_runs_before_any_database_write():
     assert order["get_trades_table"] < order["drop_already_loaded"]  # fresh read before the check
     assert order["resolve_trades_df"] < order["drop_already_loaded"] < order["resolve_assets_with_db"]
     assert order["drop_already_loaded"] < order["load_to_db"]
+    # Every nota is proven against its printout first, already loaded or not …
+    assert order["extract_fees"] < order["reconcile"] < order["get_trades_table"]
+    # … and the one write follows every prompt.
+    assert order["load_to_db"] > max(order["resolve_trades_df"], order["resolve_trades_portfolio"], order["resolve_assets_with_db"])
+
+
+def test_only_load_to_db_writes():
+    for name in ("resolve_assets_with_db", "resolve_tickers_with_db", "resolve_portfolio_with_db"):
+        calls = {n.func.attr for n in ast.walk(_function(name)) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert not calls & {"connect", "copy_from", "copy_expert", "commit"}, name

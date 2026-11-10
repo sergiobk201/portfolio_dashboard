@@ -12,6 +12,11 @@ from __future__ import annotations
 import re
 
 DEBIT, CREDIT = "D", "C"
+# Ceiling on a nota's total costs. B3 fees run a few hundredths of a percent of
+# the traded value; 1% plus R$10 (a fixed per-order fee on a tiny nota) clears
+# any real nota and still catches a misread amount of trade size.
+MAX_FEE_RATE = 0.01
+MAX_FEE_FLOOR = 10.0
 
 
 def extract_dc_flag(label: str, text: str) -> str | None:
@@ -52,3 +57,25 @@ def cblc_fees(total_cblc: float, cblc_flag: str | None, buys: float, sells: floa
     if fees < 0:
         raise ValueError(f"negative clearing fees ({fees:.2f}) — check the nota's CBLC block")
     return fees
+
+
+def check_fee_cap(fees: float, volume: float) -> None:
+    """Reject total costs no real nota carries.
+
+    Reconciliation proves the trade lines, not the cost block. A D flag read
+    on a net-sell nota, for instance, makes cblc_fees return about twice the
+    net proceeds instead of a few reais — positive, so nothing else stops it.
+
+    Args:
+        fees: The nota's total costs (clearing + Bovespa + other costs).
+        volume: Gross traded value (purchases + sales).
+
+    Raises:
+        ValueError: fees exceed MAX_FEE_RATE × volume + MAX_FEE_FLOOR.
+    """
+    cap = MAX_FEE_RATE * volume + MAX_FEE_FLOOR
+    if fees > cap:
+        raise ValueError(
+            f"nota costs {fees:.2f} exceed the {cap:.2f} cap ({MAX_FEE_RATE:.0%} of {volume:.2f} traded "
+            f"+ {MAX_FEE_FLOOR:.0f}) — check the cost block (Total CBLC D/C flag?). Nothing loaded."
+        )

@@ -7,7 +7,9 @@ SYNTHETIC DATA ONLY — this repository is public.
 
 from __future__ import annotations
 
-from decimal import Decimal
+import datetime as dt
+import unicodedata
+from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 import psycopg2
@@ -24,11 +26,15 @@ B = ("2025-03-10", "JUROS S/ CAPITAL BBBB4 S/ 7", 0.70)
 C = ("2025-03-11", "FRAÇÕES DE AÇÕES CCCC3", 0.05)
 D = ("2025-03-12", "RENDIMENTOS CLIENTE DDDD11 S/ 3", 0.36)
 NOT_INCOME = ("2025-03-11", "TED RETIRADA CONTA", -100.00)
+BLANK = None  # an empty sheet row
 
 
-def statement_sheet(lines: list[tuple[str, str, float]], footer: bool = True) -> pd.DataFrame:
-    """(movement date, description, amount) → the sheet as read below its 13-row header."""
-    rows = [[None, pd.Timestamp(day), pd.Timestamp(day), text, None, amount, 0.0] for day, text, amount in lines]
+def statement_sheet(lines: list[tuple[str, str, float] | None], footer: bool = True) -> pd.DataFrame:
+    """(movement date, description, amount) or BLANK → the sheet as read below its 13-row header."""
+    rows = [
+        [None] * 7 if line is BLANK else [None, pd.Timestamp(line[0]), pd.Timestamp(line[0]), line[1], None, line[2], 0.0]
+        for line in lines
+    ]
     if footer:
         rows += [[None] * 7, [None, None, None, "SALDO FINAL", None, None, 0.0]]
     return pd.DataFrame(rows)
@@ -79,8 +85,8 @@ class FakeLedger:
             raise pd.errors.DatabaseError("Execution failed on sql")
         stored = self.dividends.astype(object)  # psycopg2 types: DATE → date, NUMERIC → Decimal
         stored["dividend_date"] = [pd.Timestamp(v).date() for v in self.dividends["dividend_date"]]
-        for col in ("dividend", "total"):
-            stored[col] = [Decimal(str(v)).quantize(CENT) for v in self.dividends[col]]
+        for col in ("dividend", "total"):  # NUMERIC(10, 2) rounds ties away from zero
+            stored[col] = [Decimal(str(v)).quantize(CENT, rounding=ROUND_HALF_UP) for v in self.dividends[col]]
         stored["quantity"] = [int(v) for v in self.dividends["quantity"]]
         return stored
 
@@ -153,3 +159,67 @@ def test_failed_insert_is_raised_not_reported_as_success(ledger: FakeLedger, mon
         run(monkeypatch, [A])
     assert ledger.dividends.empty and ledger.rollbacks == 1
     assert issubclass(psycopg2.OperationalError, dp.CLI_ERRORS)  # the CLI reports a failure, not success
+
+
+def test_share_counts_with_a_thousands_dot_parse():
+    out = dp.parse_statement(statement_sheet([("2025-03-10", "DIVIDENDOS CLIENTE AAAA3 S/ 1.500", 150.00)]))
+    assert out[["ticker", "quantity", "dividend"]].values.tolist() == [["AAAA3", 1500, 0.10]]
+
+
+@pytest.mark.parametrize("count", ["1,5", "1.50", "CLIENTE"])
+def test_a_share_count_that_is_not_a_whole_number_fails(count: str):
+    with pytest.raises(ValueError, match=f"share count '{count}' is not a whole number"):
+        dp.parse_statement(statement_sheet([A, ("2025-03-10", f"DIVIDENDOS CLIENTE BBBB4 S/ {count}", 1.0)]))
+
+
+def test_a_blank_row_mid_sheet_does_not_drop_the_lines_after_it():
+    out = dp.parse_statement(statement_sheet([A, BLANK, NOT_INCOME, B, BLANK, C]))
+    assert out["ticker"].tolist() == ["AAAA3", "BBBB4", "CCCC3"]
+
+
+def test_types_match_in_any_unicode_form_and_singular_rendimento():
+    decomposed = (C[0], unicodedata.normalize("NFD", C[1]), C[2])
+    singular = ("2025-03-12", "RENDIMENTO CLIENTE DDDD11 S/ 3", 0.36)
+    out = dp.parse_statement(statement_sheet([decomposed, singular]))
+    assert out[["ticker", "type", "quantity"]].values.tolist() == [["CCCC3", "FRAÇÕES", 1], ["DDDD11", "RENDIMENTOS", 3]]
+
+
+def test_a_half_cent_amount_is_stored_and_matched_at_the_same_cent(ledger: FakeLedger, monkeypatch: pytest.MonkeyPatch):
+    half = ("2025-03-10", "DIVIDENDOS CLIENTE AAAA3 S/ 100", 12.345)  # 12.34499… in binary
+    assert run(monkeypatch, [half]) == 1
+    assert run(monkeypatch, [half]) == 0
+    assert ledger.dividends["total"].tolist() == ["12.35"]
+
+
+def test_income_without_a_movement_date_fails():
+    undated = [None, None, None, "DIVIDENDOS CLIENTE BBBB4 S/ 7", None, 0.70, 0.0]
+    sheet = pd.DataFrame([statement_sheet([A]).iloc[0].tolist(), undated])
+    with pytest.raises(ValueError, match="1 income line\\(s\\) without a movement date"):
+        dp.parse_statement(sheet)
+
+
+def test_income_dated_after_today_is_skipped_until_paid(capsys: pytest.CaptureFixture[str]):
+    provisioned = ("2025-04-15", "JUROS S/ CAPITAL BBBB4 S/ 7", 0.70)
+    out = dp.parse_statement(statement_sheet([A, BLANK, provisioned]), today=dt.date(2025, 3, 31))
+    assert out["ticker"].tolist() == ["AAAA3"]
+    assert "1 income line(s) dated after today (provisioned, not paid yet) skipped: 2025-04-15" in capsys.readouterr().out
+    assert len(dp.parse_statement(statement_sheet([A, BLANK, provisioned]), today=dt.date(2025, 4, 15))) == 2
+
+
+def test_an_untraded_ticker_is_asked_until_a_portfolio_is_given(
+    ledger: FakeLedger, monkeypatch: pytest.MonkeyPatch
+):
+    answers = iter(["", "   ", " growth "])  # blank answers ask again, never save a placeholder
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    assert run(monkeypatch, [("2025-03-10", "DIVIDENDOS CLIENTE EEEE3 S/ 10", 1.00)]) == 1
+    assert ledger.dividends["portfolio"].tolist() == ["GROWTH"]
+
+
+def test_ctrl_d_at_the_portfolio_prompt_saves_nothing(ledger: FakeLedger, monkeypatch: pytest.MonkeyPatch):
+    def closed(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", closed)
+    with pytest.raises(EOFError, match="nothing saved"):
+        run(monkeypatch, [A, ("2025-03-10", "DIVIDENDOS CLIENTE EEEE3 S/ 10", 1.00)])
+    assert ledger.dividends.empty and ledger.commits == 0  # not even the resolvable AAAA3 row

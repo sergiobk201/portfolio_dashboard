@@ -1,7 +1,9 @@
 # imports
+import datetime
 import pandas as pd
 import numpy as np
 import uuid
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Set
 import psycopg2
 from dotenv import load_dotenv
@@ -9,14 +11,30 @@ import os
 from io import StringIO
 
 from ledger_dedupe import DIVIDEND_KEY, LedgerUnavailableError, plan_idempotent_load
+from prompts import ask, portfolio_name
 
 
 load_dotenv()
 unresolved_placeholder = "!!!_input_required_!!!"
 
 INCOME_TYPES = ["JUROS", "DIVIDENDOS", "FRAÇÕES", "RENDIMENTOS"]
+TYPE_ALIASES = {"RENDIMENTO": "RENDIMENTOS"}  # singular on some statement lines
 # "<TYPE> … <TICKER> <word> <QTY>"; FRAÇÕES lines end with the ticker instead.
 PER_SHARE_TYPES = ["JUROS", "DIVIDENDOS", "RENDIMENTOS"]
+SHARE_COUNT = r"\d{1,3}(?:\.\d{3})+|\d+"  # "1.500" carries a thousands dot
+CENT = Decimal("0.01")
+
+
+def to_cents(values: pd.Series) -> pd.Series:
+    """Money rounded to the cent half away from zero, as Postgres NUMERIC stores it.
+
+    numpy rounds half to even (and 12.345 is 12.34499… in binary), so a
+    half-cent amount would be keyed one cent off the stored row and re-inserted
+    on every run. Decimal(repr) rounds the printed value, element-wise on purpose.
+    """
+    return values.map(
+        lambda v: float(Decimal(repr(float(v))).quantize(CENT, rounding=ROUND_HALF_UP)), na_action="ignore"
+    )
 
 DB_READ_ERRORS = (psycopg2.Error, pd.errors.DatabaseError)
 # Operational failures reported by the CLI; anything else is a bug and keeps
@@ -34,17 +52,26 @@ CLI_ERRORS = (
 )
 
 
-def parse_statement(raw: pd.DataFrame) -> pd.DataFrame:
+def parse_statement(raw: pd.DataFrame, today: datetime.date | None = None) -> pd.DataFrame:
     """Income rows from a broker statement sheet.
+
+    Every income line counts wherever it sits: a blank row mid-sheet no longer
+    ends the ledger (the footer and blank rows carry no income type). Credits
+    dated after ``today`` are provisioned, not paid: they are skipped with a
+    warning and load from the statement that shows them paid.
 
     Args:
         raw: The sheet as read below its 13-row header. Columns 1, 2, 3, 5, 6
             hold the movement date, clearing date, description, amount and
-            running balance; the ledger ends at the first blank movement date.
+            running balance.
+        today: Cut-off for paid income (default: the run date).
 
     Returns:
         One row per income line, in the dividends-table column order, with
-        unresolved ids and portfolios.
+        unresolved ids and portfolios and amounts rounded to the cent.
+
+    Raises:
+        ValueError: An income line has no movement date or no whole share count.
     """
     file = raw.iloc[:, [1, 2, 3, 5, 6]].copy()
     file.columns = [
@@ -54,18 +81,26 @@ def parse_statement(raw: pd.DataFrame) -> pd.DataFrame:
         "total",
         "balance",
     ]
-    blank = file["dividend_date"].isna().to_numpy()
-    if blank.any():  # without a blank row argmax() is 0 and nothing would load
-        file = file.iloc[: int(blank.argmax())].copy()
-
-    file["dividend_date"] = pd.to_datetime(file["dividend_date"])
-    file["clearing_date"] = pd.to_datetime(file["clearing_date"])
-    file["dividend_date"] = file["dividend_date"].dt.date
-    file["clearing_date"] = file["clearing_date"].dt.date
-
-    file["type"] = file["description"].str.split().str[0]
-
+    # Type = first word, NFC: Excel may store "FRAÇÕES" decomposed.
+    file["type"] = file["description"].str.normalize("NFC").str.split().str[0].replace(TYPE_ALIASES)
     filtered = file[file["type"].isin(INCOME_TYPES)].copy()
+
+    undated = filtered["dividend_date"].isna()
+    if undated.any():
+        raise ValueError(
+            f"{undated.sum()} income line(s) without a movement date, first: "
+            f"'{filtered.loc[undated, 'description'].iloc[0]}' — statement layout changed?"
+        )
+    filtered["dividend_date"] = pd.to_datetime(filtered["dividend_date"]).dt.date
+    filtered["clearing_date"] = pd.to_datetime(filtered["clearing_date"]).dt.date
+
+    future = filtered["dividend_date"] > (today or datetime.date.today())
+    if future.any():
+        print(
+            f"⚠️ {future.sum()} income line(s) dated after today (provisioned, not paid yet) skipped: "
+            f"{', '.join(sorted({d.isoformat() for d in filtered.loc[future, 'dividend_date']}))}"
+        )
+        filtered = filtered.loc[~future].copy()
 
     # 1. Split the description into a list of words
     description_split = filtered["description"].str.split()
@@ -80,14 +115,21 @@ def parse_statement(raw: pd.DataFrame) -> pd.DataFrame:
         description_split.str[-1],  # FRAÇÕES ticker position
     )
 
+    count = description_split.str[-1]
+    bad = is_standard_type & ~count.astype(str).str.fullmatch(SHARE_COUNT)
+    if bad.any():
+        raise ValueError(
+            f"income line '{filtered.loc[bad, 'description'].iloc[0]}': share count "
+            f"'{count[bad].iloc[0]}' is not a whole number — statement layout changed?"
+        )
     filtered["quantity"] = np.where(
         is_standard_type,
-        description_split.str[-1],  # Standard quantity position
+        count.str.replace(".", "", regex=False),  # Standard quantity position, thousands dot dropped
         "1",  # Default for FRAÇÕES
     )
 
     filtered["quantity"] = filtered["quantity"].astype("int32")
-    filtered["total"] = filtered["total"].astype("float64")
+    filtered["total"] = to_cents(filtered["total"].astype("float64"))  # before the duplicate check
     filtered["dividend"] = (filtered["total"] / filtered["quantity"]).round(2)
     filtered["portfolio"] = unresolved_placeholder
     filtered["dividend_id"] = None
@@ -313,19 +355,11 @@ class DividendsPipeline:
 
         print(f"--- {len(unresolved_indices)} trades still require manual input ---")
 
-        for idx in unresolved_indices:
+        for idx in unresolved_indices:  # Ctrl-D stops the import before load_new_divs
             asset_name = df_copy.loc[idx, asset_column]
-            try:
-                new_portfolio = input(f"[{idx}] enter portfolio for '{asset_name}': ")
-                if new_portfolio.strip():
-                    df_copy.loc[idx, portfolio_column] = new_portfolio.strip().upper()
-                    print(
-                        f"✅ assigned '{new_portfolio.strip().upper()}' to '{asset_name}'."
-                    )
-                else:
-                    df_copy.loc[idx, portfolio_column] = unresolved_placeholder
-            except (EOFError, OSError, ValueError):  # no usable stdin
-                df_copy.loc[idx, portfolio_column] = unresolved_placeholder
+            portfolio = ask(f"[{idx}] enter portfolio for '{asset_name}': ", portfolio_name, "a portfolio name")
+            df_copy.loc[idx, portfolio_column] = portfolio
+            print(f"✅ assigned '{portfolio}' to '{asset_name}'.")
 
         return df_copy
 
