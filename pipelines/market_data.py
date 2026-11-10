@@ -25,6 +25,7 @@ repository's Actions logs are public.
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from collections.abc import Collection
 from datetime import date, datetime, timedelta
@@ -62,6 +63,8 @@ FETCH_ERRORS = (
 
 B3_COTAHIST_URL = "https://bvmf.bmfbovespa.com.br/InstDados/SerHist/{name}.ZIP"
 B3_MIN_DAILY_RECORDS = 300  # a real session file has ~1,000+ cash-market tickers
+B3_TIMEOUT = (10.0, 30.0)  # (connect, read) seconds; the read timeout applies per chunk
+B3_FILE_DEADLINE_S = 120.0  # a ~0.5 MB daily file normally arrives in seconds
 
 # 1:1 ticker renames: the ledger books positions under the CURRENT code, but B3
 # printed the old code before the switch date. {current: [(old, first day of current)]}
@@ -170,17 +173,45 @@ def apply_renames(closes: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(["ticker", "date"], keep="last").reset_index(drop=True)
 
 
-def b3_daily_closes(day: date | pd.Timestamp, timeout: int = 60) -> pd.DataFrame:
-    """Every official close for one session (B3 publishes ~3h after the close).
+def _download(url: str, timeout: float | tuple[float, float], deadline_s: float) -> bytes:
+    """GET ``url`` into memory, abandoned once ``deadline_s`` seconds have passed.
+
+    requests' read timeout only bounds the wait for each chunk, so a host that
+    trickles bytes would never time out on its own.
 
     Raises:
-        One of FETCH_ERRORS: HTTP 404 before publication, a truncated file,
-        or a file too small to be a real session.
+        requests.RequestException: HTTP error, timeout or an overdue download
+            (the message never carries the URL).
+    """
+    start = time.monotonic()
+    with requests.get(url, timeout=timeout, stream=True) as resp:
+        resp.raise_for_status()
+        chunks: list[bytes] = []
+        for chunk in resp.iter_content(chunk_size=1 << 16):
+            if time.monotonic() - start > deadline_s:
+                raise requests.Timeout(f"download exceeded {deadline_s:.0f}s")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def b3_daily_closes(
+    day: date | pd.Timestamp,
+    timeout: float | tuple[float, float] = B3_TIMEOUT,
+    deadline_s: float = B3_FILE_DEADLINE_S,
+) -> pd.DataFrame:
+    """Every official close for one session (B3 publishes ~3h after the close).
+
+    Args:
+        day: Session to download.
+        timeout: requests timeout, (connect, read) seconds.
+        deadline_s: Wall-clock limit for the whole download.
+
+    Raises:
+        One of FETCH_ERRORS: HTTP 404 before publication, a timed-out or
+        truncated download, or a file too small to be a real session.
     """
     name = f"COTAHIST_D{pd.Timestamp(day):%d%m%Y}"
-    resp = requests.get(B3_COTAHIST_URL.format(name=name), timeout=timeout)
-    resp.raise_for_status()
-    closes = parse_cotahist(resp.content)
+    closes = parse_cotahist(_download(B3_COTAHIST_URL.format(name=name), timeout, deadline_s))
     if len(closes) < B3_MIN_DAILY_RECORDS or not (closes["date"] == pd.Timestamp(day)).all():
         raise ValueError(f"B3 file for {pd.Timestamp(day).date()} looks incomplete ({len(closes)} records)")
     return closes

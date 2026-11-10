@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backfill_history import calendar_year_returns, irpf_asset_class, monthly_tax_view, plan_prices
+from backfill_history import (
+    calendar_year_returns,
+    irpf_asset_class,
+    monthly_tax_view,
+    plan_corporate_actions,
+    plan_prices,
+)
 from builders import SESSIONS as S
 from builders import actions_frame, prices_frame, trades_frame
 from portfolio_engine import normalize_corporate_actions
@@ -114,3 +120,26 @@ def test_monthly_tax_view_separates_exempt_and_taxable_sales():
     assert not bool(out.loc[("2025-02", "BDR"), "exempt_swing"])
     assert out.loc[("2025-03", "ACOES"), "day_trades"] == 1
     assert not bool(out.loc[("2025-03", "ACOES"), "exempt_swing"])
+
+
+def test_planned_corporate_actions_match_recorded_ones_within_the_window():
+    day = pd.Timestamp
+    stored = actions_frame([("AAAA3", day("2025-03-12"), 1.0)])  # rejected by hand: ratio = 1
+    yahoo = pd.DataFrame(
+        {
+            "ticker": ["AAAA3", "AAAA3", "BBBB4", "BBBB4", "CYRE3"],
+            "ex_date": [day("2025-03-02"), day("2025-09-01"), day("2025-05-09"), day("2025-05-05"), day("2025-12-30")],
+            "ratio": [5.0, 2.0, 1.1, 1.1, 1.18],
+        }
+    )
+    plan = plan_corporate_actions(stored, yahoo)
+    # AAAA3 03-02 is the rejected 03-12 row (10 days), BBBB4 is one event (the earliest
+    # date), and CYRE3 on its data-com is the manual 2026-01-02 bonus, which wins.
+    assert list(zip(plan["ticker"], plan["ex_date"], plan["source"])) == [
+        ("BBBB4", day("2025-05-05"), "yahoo"),
+        ("AAAA3", day("2025-09-01"), "yahoo"),
+        ("CYRE3", day("2026-01-02"), "manual"),
+    ]
+    assert plan_corporate_actions(stored, yahoo.assign(ex_date=yahoo["ex_date"] - pd.Timedelta(days=1)))[
+        "ticker"
+    ].tolist().count("AAAA3") == 2  # 11 days from the rejected row: a different event

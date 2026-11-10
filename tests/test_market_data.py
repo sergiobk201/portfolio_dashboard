@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -106,26 +107,54 @@ def test_last_completed_session_uses_exchange_local_dates(now_utc: str, b3: str,
 
 
 class _Response:
+    """Streamed requests.Response stand-in."""
+
     def __init__(self, content: bytes, status: int = 200) -> None:
         self.content, self.status_code = content, status
+
+    def __enter__(self) -> _Response:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise requests.HTTPError(f"HTTP {self.status_code}")
 
+    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start : start + chunk_size]
+
+
+FULL_SESSION = cotahist_zip([cotahist_line("2025-03-10", f"T{i:04d}3", 1.0 + i) for i in range(B3_MIN_DAILY_RECORDS)])
+
 
 def test_b3_daily_file_must_look_like_a_full_session(monkeypatch: pytest.MonkeyPatch):
     tiny = cotahist_zip([cotahist_line("2025-03-10", "AAAA3", 12.0)])
-    monkeypatch.setattr(market_data.requests, "get", lambda url, timeout: _Response(tiny))
+    monkeypatch.setattr(market_data.requests, "get", lambda url, **kw: _Response(tiny))
     with pytest.raises(ValueError, match="incomplete"):
         market_data.b3_daily_closes(TS("2025-03-10"))
 
-    full = cotahist_zip([cotahist_line("2025-03-10", f"T{i:04d}3", 1.0 + i) for i in range(B3_MIN_DAILY_RECORDS)])
-    monkeypatch.setattr(market_data.requests, "get", lambda url, timeout: _Response(full))
+    monkeypatch.setattr(market_data.requests, "get", lambda url, **kw: _Response(FULL_SESSION))
     with pytest.raises(ValueError, match="incomplete"):  # file dated differently from the request
         market_data.b3_daily_closes(TS("2025-03-11"))
     assert len(market_data.b3_daily_closes(TS("2025-03-10"))) == B3_MIN_DAILY_RECORDS
 
-    monkeypatch.setattr(market_data.requests, "get", lambda url, timeout: _Response(b"", 404))
+    monkeypatch.setattr(market_data.requests, "get", lambda url, **kw: _Response(b"", 404))
     with pytest.raises(requests.HTTPError):  # not published yet
         market_data.b3_daily_closes(TS("2025-03-12"))
+
+
+def test_b3_download_is_abandoned_past_its_deadline(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, object] = {}
+
+    def get(url: str, **kw: object) -> _Response:
+        seen.update(kw)
+        return _Response(FULL_SESSION)
+
+    monkeypatch.setattr(market_data.requests, "get", get)
+    with pytest.raises(requests.Timeout) as err:  # a trickling host never trips the per-read timeout
+        market_data.b3_daily_closes(TS("2025-03-10"), deadline_s=-1.0)
+    assert "bmfbovespa" not in str(err.value)
+    assert seen == {"timeout": market_data.B3_TIMEOUT, "stream": True}

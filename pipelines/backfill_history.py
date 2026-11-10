@@ -49,12 +49,11 @@ from dotenv import load_dotenv
 from psycopg2.extensions import cursor as PgCursor
 
 import db
-from calculate_daily_twr import MONEY_COLUMNS, RETURN_COLUMNS, SyncPlan, compute, for_storage, plan_sync
+from calculate_daily_twr import SyncPlan, compute, for_storage, plan_sync
 from market_data import (
     B3_CALENDAR,
     B3_TZ,
     FETCH_ERRORS,
-    NY_TZ,
     NYSE_CALENDAR,
     apply_renames,
     b3_annual_closes,
@@ -77,7 +76,14 @@ from portfolio_engine import (
     normalize_trades,
     xirr,
 )
-from prices_pipeline import NO_TRADE_SOURCE, OFFICIAL_SOURCE, PRICE_DECIMALS, classify_action, required_pairs
+from prices_pipeline import (
+    CA_MATCH_DAYS,
+    NO_TRADE_SOURCE,
+    OFFICIAL_SOURCE,
+    PRICE_DECIMALS,
+    classify_action,
+    required_pairs,
+)
 
 PRICE_TOLERANCE = 0.005  # half a cent: anything larger is a different close
 SQL_CHUNK_ROWS = 2000
@@ -326,15 +332,32 @@ def yahoo_corporate_actions(tickers: Iterable[str], start: pd.Timestamp, cache_d
 
 
 def plan_corporate_actions(stored: pd.DataFrame, yahoo: pd.DataFrame) -> pd.DataFrame:
-    """Events to insert: Yahoo + manual, minus what is already recorded."""
-    events = yahoo.assign(
-        action_type=yahoo["ratio"].map(classify_action), source="yahoo", notes=None
-    )
-    events = pd.concat([events, MANUAL_CORPORATE_ACTIONS], ignore_index=True)
-    events["ex_date"] = pd.to_datetime(events["ex_date"])
-    known = set(zip(stored["ticker"], pd.to_datetime(stored["ex_date"]))) if not stored.empty else set()
-    fresh = np.array([(tk, d) not in known for tk, d in zip(events["ticker"], events["ex_date"])], dtype=bool)
-    return events[fresh].drop_duplicates(["ticker", "ex_date"]).reset_index(drop=True)
+    """Events to insert: manual + Yahoo, minus what is already recorded.
+
+    The daily sync's rule: a row for the ticker within CA_MATCH_DAYS of an
+    event is that event, whatever its ratio (a corrected date, or ratio = 1 to
+    reject it). Planned events that close to each other are one event: the
+    manual (hand-verified) row, else the earliest Yahoo date.
+
+    Args:
+        stored: ``corporate_actions`` rows already in the database.
+        yahoo: Yahoo events [ticker, ex_date, ratio].
+
+    Returns:
+        Rows to insert, ordered by ex-date.
+    """
+    found = yahoo.reindex(columns=["ticker", "ex_date", "ratio"]).sort_values("ex_date", kind="mergesort")
+    found = found.assign(action_type=found["ratio"].map(classify_action), source="yahoo", notes=None)
+    events = pd.concat([MANUAL_CORPORATE_ACTIONS, found], ignore_index=True)
+    events["ex_date"] = pd.to_datetime(events["ex_date"]).dt.normalize()
+    window = pd.Timedelta(days=CA_MATCH_DAYS)
+    taken = normalize_corporate_actions(stored).groupby("ticker")["ex_date"].agg(list).to_dict()
+    keep = np.zeros(len(events), dtype=bool)
+    for i, (tk, day) in enumerate(zip(events["ticker"].str.strip().str.upper(), events["ex_date"])):  # handful
+        if all(abs(day - seen) > window for seen in taken.get(tk, [])):
+            keep[i] = True
+            taken.setdefault(tk, []).append(day)
+    return events[keep].sort_values(["ex_date", "ticker"], kind="mergesort").reset_index(drop=True)
 
 
 def check_corporate_actions(actions: pd.DataFrame, official: pd.DataFrame) -> pd.DataFrame:
