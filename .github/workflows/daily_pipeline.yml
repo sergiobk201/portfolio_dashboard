@@ -96,6 +96,34 @@ jobs:
       - run: pip install -r prices_requirements.txt
       - run: python pipelines/calculate_daily_twr.py
 
+  notify-failure:
+    # The scripts alert on data problems themselves. This covers a red job they
+    # cannot report (test gate, setup, crash, DB outage, timeout), which would
+    # otherwise reach Telegram only as a missing digest.
+    name: Telegram on failure
+    needs: [verify, market-data, performance]
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          PORT_BOT_TOKEN: ${{ secrets.PORT_BOT_TOKEN }}
+          PORT_BOT_CHAT: ${{ secrets.PORT_BOT_CHAT }}
+          RESULTS: "tests ${{ needs.verify.result }} · prices ${{ needs.market-data.result }} · performance ${{ needs.performance.result }}"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$PORT_BOT_TOKEN" ] || [ -z "$PORT_BOT_CHAT" ]; then
+            echo "[alert] Telegram not configured"
+            exit 0
+          fi
+          text=$(printf '❌ Daily pipeline failed\n%s\n%s' "$RESULTS" "$RUN_URL")
+          # -sS --fail: errors print the status only, never the URL (it holds the token).
+          curl -sS --fail -o /dev/null --max-time 15 \
+            --data-urlencode "chat_id=$PORT_BOT_CHAT" \
+            --data-urlencode "text=$text" \
+            "https://api.telegram.org/bot$PORT_BOT_TOKEN/sendMessage"
+          echo "[alert] Telegram alert sent"
+
   keepalive:
     # GitHub disables schedules in public repos after 60 days without
     # repository activity; re-enabling through the API resets that clock.

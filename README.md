@@ -81,14 +81,15 @@ streamlit run public_app.py
 The pipelines read the variables listed in [`.env.example`](.env.example). Locally they come from `.env` at the repository root. In Actions they come from repository secrets.
 
 ### Pipelines
-`.github/workflows/daily_pipeline.yml` runs at 07:30 BRT, with an idempotent retry at 13:30:
+`.github/workflows/daily_pipeline.yml` is scheduled for 07:30 BRT, with an idempotent retry at 13:30. GitHub often starts scheduled runs hours late. Every job targets the last completed session, so the start time never changes the numbers.
 
 | Step | Module | What it does |
 |---|---|---|
 | gate | `tests/` | Runs the synthetic-data test suite. Any failure blocks every write. |
 | prices | `prices_pipeline.py` | Fills every held (ticker, session) gap from B3 COTAHIST, then Yahoo raw, then BRAPI. Marks confirmed no-trade sessions and syncs splits and bonuses. |
 | benchmark | `spy_pipeline.py` | Stores SPY closes on NYSE sessions (FMP, then Yahoo raw). |
-| performance | `calculate_daily_twr.py` | Rebuilds the whole series from the ledger and writes only the changed rows. |
+| performance | `calculate_daily_twr.py` | Rebuilds the whole series from the ledger, writes only the changed rows and sends the Telegram digest for each new session. |
+| notify | workflow job | Posts to Telegram when any job above fails or times out, with the run link. |
 
 Shared modules: `portfolio_engine.py` (pure, vectorized accounting), `dashboard_metrics.py` (pure dashboard statistics), `market_data.py` (calendars and providers), `db.py` and `alerts.py` (Telegram).
 Ledger ingestion: `gmail_automation.py` reads trades from the notas de corretagem (fee math in `nota_fees.py`), and `dividends_pipeline.py` reads income.
@@ -106,6 +107,8 @@ The daily pipeline runs on its own. Once a month, load the new ledger entries. T
 
 | Alert | Meaning | Action |
 |---|---|---|
+| 📊 Portfolio — *date* | The daily digest: the session's return and P&L, MTD, YTD, TWR since inception and value. One per B3 session, sent by the first run after it (Tuesday to Saturday). Retries and weekends stay quiet. | None. **A missing digest the day after a session means the pipeline did not finish:** check the Actions tab. |
+| ❌ Daily pipeline failed | A job ended red. The message lists each job's result and links the run. | Open the run. If a ⚠️ alert just before it explains the failure (a missing close), there is nothing to do. |
 | 📝 History revised from *date* | Rows older than the 7-day grace window changed | **Expected after a monthly import** (back-dated trades or income) or a corporate-action insert. Otherwise, find out what changed. |
 | 🧾 New corporate actions applied | A split or bonus reported by Yahoo is now applied | Check the ratio and ex-date against the broker's notice. |
 | ⚠️ No close for *date* / SPY close missing | No source has that session's bar yet | Nothing to do. The retry fills it, and the previous close is carried meanwhile. The Actions run shows red until then. |

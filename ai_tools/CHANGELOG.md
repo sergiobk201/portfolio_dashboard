@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] — 2026-11-10
+### Why
+The daily Telegram messages stopped after 0.4.0. Before it, the TWR job sent "🔴 Cumulative TWR is negative" on almost every run from Aug 4 to Nov 1, because the pre-0.4.0 series sat between −6 % and +3 %. The corrected series is about +30 %. 0.4.0 rightly removed that alarm as spam, but it was also the only message on a healthy day. A working pipeline and a broken channel then looked the same: silence. A run that died before a script could alert (the test gate, setup, a crash, a DB outage) never reached Telegram either.
+
+### Added
+- Daily digest (`calculate_daily_twr.py`): one Telegram message per B3 session the run appends.
+  - It carries the session's return, the BRL P&L net of contributions, MTD, YTD, TWR since inception and value, all as of the session close.
+  - A catch-up run reports every appended session at once, so each change in value lands in exactly one digest.
+  - Retries and non-session days send nothing.
+- `notify-failure` job (`daily_pipeline.yml`): when any job fails or times out, Telegram gets each job's result and the run link.
+- Tests for the digest: the span, the MTD/YTD bases, P&L net of inflows, the catch-up and first-run cases. All mutation-checked.
+
+### Lessons
+- Silence is not a signal. An alert-only channel needs a heartbeat, or a broken pipeline looks like a healthy one.
+- An alert that fires every day is a symptom. "TWR is negative" was the old engine's error, reported as news.
+
 ## [0.5.0] — 2026-11-03
 ### Why
 After 0.4.0 the stored numbers were right, but the public dashboard still computed its own holdings and YTD from raw trades and prices. It ignored the 19 corporate actions (5:1 splits showed as −80 %), used a USD T-bill rate and a USD price-only SPY, and swallowed every error in `except Exception: pass`.

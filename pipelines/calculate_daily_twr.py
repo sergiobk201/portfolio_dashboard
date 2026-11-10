@@ -19,6 +19,12 @@ Write policy
     trade date). If the series would lose more than MAX_SHRINK_DAYS at the
     end, the run aborts instead — that means missing data, not a correction.
 
+Telegram
+  • A digest for every B3 session the run appends: day, MTD, YTD and
+    inception TWR, value and P&L. One per session, so a retry or a weekend
+    run stays quiet; no digest the day after a session means check Actions.
+  • Alerts for anything that needs a human look (see build_alerts).
+
 Public-log hygiene: the repository and its Actions logs are public, so stdout
 carries dates, counts and percentages only. Amounts go to Telegram.
 
@@ -59,6 +65,21 @@ class SyncPlan:
     changed: int  # existing rows whose values changed
     revised_from: pd.Timestamp | None  # earliest changed date before the grace window
     previous_end: pd.Timestamp | None  # last stored date before this run
+
+
+@dataclass(frozen=True)
+class Digest:
+    """Figures for the daily Telegram digest, as of one session close (returns are decimals)."""
+
+    session: pd.Timestamp  # newest session this run appended
+    base: pd.Timestamp | None  # last session already stored (None on the first run)
+    sessions: int  # sessions appended this run (>1 after a catch-up)
+    period_return: float  # TWR from the base close to the session close
+    pnl: float  # BRL over the same span, net of external inflows
+    mtd: float
+    ytd: float
+    itd: float  # cumulative TWR since inception
+    value: float
 
 
 def for_storage(perf: pd.DataFrame) -> pd.DataFrame:
@@ -189,6 +210,79 @@ def build_alerts(result: EngineResult, new: pd.DataFrame, stored: pd.DataFrame, 
     return alerts
 
 
+def _growth_since(level: pd.Series, base: pd.Timestamp) -> float:
+    """TWR from the close as of ``base`` to the last row; the level before inception is 1."""
+    start = float(level.asof(base)) if base >= level.index[0] else 1.0
+    return float(level.iloc[-1]) / start - 1.0
+
+
+def build_digest(new: pd.DataFrame, plan: SyncPlan) -> Digest | None:
+    """Digest for the newest session this run appends, or None.
+
+    The span starts at the last session already stored, so a catch-up run
+    reports every appended session at once and each change in value lands
+    in exactly one digest. A retry or a non-session day appends no session.
+
+    Args:
+        new: Output of :func:`for_storage` for this run.
+        plan: This run's SyncPlan; ``previous_end`` marks what was stored.
+
+    Returns:
+        Digest, or None when no session was appended.
+    """
+    after = plan.previous_end if plan.previous_end is not None else pd.Timestamp.min
+    sessions = new.loc[new["is_trading_day"], "date"]
+    appended = sessions[sessions > after]
+    if appended.empty:
+        return None
+    session = appended.iloc[-1]
+    stored = sessions[sessions <= after]
+    base = stored.iloc[-1] if not stored.empty else None
+
+    # Everything is as of the session close, even if the series runs past it.
+    upto = new[new["date"] <= session]
+    level = pd.Series(1.0 + upto["twr"].to_numpy(dtype=float), index=pd.DatetimeIndex(upto["date"]))
+    last = upto.iloc[-1]
+    if base is None:  # first run: the span is the whole history
+        period, value_base, span = float(last["twr"]), 0.0, upto["date"].notna()
+    else:
+        period = _growth_since(level, base)
+        value_base = float(upto.loc[upto["date"] == base, "portfolio_value"].iloc[0])
+        span = upto["date"] > base
+    day_before = pd.Timedelta(days=1)
+    return Digest(
+        session=session,
+        base=base,
+        sessions=len(appended),
+        period_return=period,
+        # Same span as the return: change in value minus money put in.
+        pnl=float(last["portfolio_value"]) - value_base - float(upto.loc[span, "external_inflow"].sum()),
+        mtd=_growth_since(level, session.replace(day=1) - day_before),
+        ytd=_growth_since(level, pd.Timestamp(session.year, 1, 1) - day_before),
+        itd=float(last["twr"]),
+        value=float(last["portfolio_value"]),
+    )
+
+
+def format_digest(d: Digest) -> str:
+    """Telegram HTML for a Digest (amounts allowed: private channel)."""
+    if d.base is None:
+        label = "Since inception"
+    elif d.sessions == 1:
+        label = "Day"
+    else:
+        label = f"Since {d.base.date()} ({d.sessions} sessions)"
+    return "\n".join(
+        [
+            f"📊 <b>Portfolio — {d.session:%a %Y-%m-%d}</b>",
+            f"{label}: <b>{d.period_return:+.2%}</b> (R$ {d.pnl:+,.2f})",
+            f"MTD {d.mtd:+.2%} · YTD {d.ytd:+.2%}",
+            f"TWR since inception {d.itd:+.2%}",
+            f"Value {_brl(d.value)}",
+        ]
+    )
+
+
 def main() -> int:
     """Recompute, validate and sync. Returns the process exit code."""
     load_dotenv()
@@ -229,6 +323,11 @@ def main() -> int:
     print(f"[twr] upserted {written} row(s) ({plan.changed} changed), deleted {deleted} | revised history: {revised}")
     print(f"[twr] cumulative TWR {last['twr']:+.4%} | last daily return {last['daily_return']:+.4%}")
 
+    # Digest first, alerts last: the newest notification is the one on top.
+    digest = build_digest(new, plan)
+    if digest is not None:
+        print(f"[twr] digest for session {digest.session.date()} ({digest.sessions} appended)")
+        send_telegram(format_digest(digest))
     alerts = build_alerts(result, new, stored, plan)
     if alerts:
         send_telegram("\n\n".join(alerts))
