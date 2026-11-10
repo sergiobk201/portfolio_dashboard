@@ -35,6 +35,8 @@ from portfolio_engine import (
 )
 
 TRADING_DAYS = 252
+# Record date (data-com) → payment: JCP credited in December may be paid late the next year.
+RECORD_LOOKBACK_DAYS = 400
 HOLDINGS_COLUMNS = ["ticker", "quantity", "price", "value"]
 SEGMENT_COLUMNS = ["Portfolio", "YTD Change", "DY %", "Weight %"]
 
@@ -92,26 +94,33 @@ def adjusted_prices(prices: pd.DataFrame, corporate_actions: pd.DataFrame | None
     return p.assign(adj_price=p["price"].to_numpy() * factor[rows, cols] / factor[-1, cols])
 
 
-def ytd_changes(adjusted: pd.DataFrame, year_start: pd.Timestamp) -> pd.Series:
-    """Per-ticker % change from the last close before ``year_start`` to the latest.
+def ytd_changes(
+    adjusted: pd.DataFrame, year_start: pd.Timestamp, base_session: pd.Timestamp | None
+) -> pd.Series:
+    """Per-ticker % change from the close on ``base_session`` to the latest.
 
-    A ticker with no close before ``year_start`` starts from its first close.
+    ``prices`` only holds sessions on which a ticker was held, so an older
+    close belongs to an earlier holding period and is never a YTD base. A
+    ticker with no close on ``base_session`` (bought or re-bought during the
+    year) starts from its first close on or after ``year_start``.
 
     Args:
         adjusted: Output of :func:`adjusted_prices`.
         year_start: First day of the period (Jan 1 for YTD).
+        base_session: Last B3 session before ``year_start``, or None when the
+            history starts after it.
 
     Returns:
-        Series of percentages indexed by ticker.
+        Series of percentages indexed by ticker (tickers without a base left out).
     """
     if adjusted.empty:
         return pd.Series(dtype=float)
     a = adjusted.sort_values(["ticker", "date"], kind="mergesort")
-    before = a[a["date"] < year_start].groupby("ticker")["adj_price"].last()
-    first = a.groupby("ticker")["adj_price"].first()
-    start = before.reindex(first.index).fillna(first)
+    held_over = a[a["date"] == base_session] if base_session is not None else a.iloc[:0]
+    first_in_year = a[a["date"] >= year_start].groupby("ticker")["adj_price"].first()
+    start = held_over.groupby("ticker")["adj_price"].last().combine_first(first_in_year)
     end = a.groupby("ticker")["adj_price"].last()
-    return (end / start - 1.0) * 100.0
+    return ((end / start - 1.0) * 100.0).dropna()
 
 
 # ── Holdings and segments ────────────────────────────────────────────────────
@@ -168,11 +177,18 @@ def income_events(dividends: pd.DataFrame) -> pd.DataFrame:
 
 
 def weighted_ytd(held: pd.DataFrame, ytd: pd.Series) -> float:
-    """Value-weighted YTD % of a set of holdings (0 when nothing is valued)."""
-    total = float(held["value"].sum()) if not held.empty else 0.0
-    if not total:
-        return 0.0
-    return float((held["value"] * held["ticker"].map(ytd).fillna(0.0)).sum() / total)
+    """YTD % of a basket of holdings: Σ value / Σ start value − 1 (0 when nothing is valued).
+
+    Start value = value / (1 + r), i.e. returns weighted by what each position
+    was worth on Jan 1. End-value weights favour winners: equal stakes at
+    +100 % and −50 % would read +70 % instead of the basket's +25 %.
+    Positions with no value or no defined start (r ≤ −100 %) are left out.
+    """
+    value = held["value"].to_numpy(dtype=float)
+    growth = 1.0 + held["ticker"].map(ytd).fillna(0.0).to_numpy(dtype=float) / 100.0
+    ok = np.isfinite(value) & (value > 0) & np.isfinite(growth) & (growth > 0)
+    start = float((value[ok] / growth[ok]).sum())
+    return (float(value[ok].sum()) / start - 1.0) * 100.0 if start > 0 else 0.0
 
 
 def segment_scorecard(
@@ -182,15 +198,20 @@ def segment_scorecard(
     dividends: pd.DataFrame,
     year_start: pd.Timestamp,
     tickers: Collection[str] | None = None,
+    *,
+    base_session: pd.Timestamp | None,
 ) -> pd.DataFrame:
     """YTD scorecard per portfolio segment: price change, dividend yield, weight.
+
+    ``base_session`` is the last B3 session before ``year_start`` (see
+    :func:`ytd_changes`).
 
     Returns:
         DataFrame[Portfolio, YTD Change, DY %, Weight %] (percentages).
     """
     if trades.empty:
         return pd.DataFrame(columns=SEGMENT_COLUMNS)
-    ytd = ytd_changes(adjusted, year_start)
+    ytd = ytd_changes(adjusted, year_start, base_session)
     grand = float(holdings(trades, corporate_actions, adjusted, tickers=tickers)["value"].sum())
     income = income_events(dividends)
     if not income.empty:
@@ -220,30 +241,88 @@ def dividend_yields(
     dividends: pd.DataFrame,
     adjusted: pd.DataFrame,
     corporate_actions: pd.DataFrame | None,
+    trades: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Per-event dividend yield (%) against the latest close, in today's share basis.
 
     The per-share amount is ``total / quantity``: the stored ``dividend``
     column has 2 decimals, which rounds small JCP / FII amounts by up to a
     third (or to zero). It falls back to ``dividend`` when quantity is
-    missing. An amount paid before a 1:5 split is divided by 5 so it is
-    comparable with the post-split close.
+    missing. An amount struck on pre-split shares is divided by the ratio
+    (5 for a 1:5 split) so it is comparable with the post-split close.
+
+    The ledger has payment dates, not record dates (data-com), and JCP is
+    often paid months after its record date. A row paid before an ex-date is
+    pre-split. A row paid on or after it is pre-split when its quantity (the
+    position on its record date) was held in the ``RECORD_LOOKBACK_DAYS``
+    before the ex-date and never from the ex-date to the payment. Any other
+    row keeps the payment-date basis.
+
+    Args:
+        dividends: Income rows [dividend_date, ticker, dividend, total, quantity].
+        adjusted: Output of :func:`adjusted_prices`.
+        corporate_actions: ``corporate_actions`` rows, or None.
+        trades: The whole ``trades`` ledger for the record-date rule, or None
+            (payment date only).
+
+    Returns:
+        Percentages aligned to ``dividends`` (NaN for an unpriced ticker).
     """
     if dividends.empty or adjusted.empty:
         return pd.Series(np.nan, index=dividends.index, dtype=float)
     last = adjusted.groupby("ticker")["adj_price"].last()
     paid = _day(dividends["dividend_date"])
     per_share = pd.to_numeric(dividends["dividend"], errors="coerce").astype(float)
+    qty = pd.Series(np.nan, index=dividends.index)
     if {"total", "quantity"} <= set(dividends.columns):
         qty = pd.to_numeric(dividends["quantity"], errors="coerce").astype(float)
         exact = pd.to_numeric(dividends["total"], errors="coerce").astype(float) / qty.where(qty > 0)
         per_share = exact.fillna(per_share)
-    ca = normalize_corporate_actions(corporate_actions)
-    ca = ca[ca["ex_date"] <= adjusted["date"].max()]  # same basis as the latest close
+    all_ca = normalize_corporate_actions(corporate_actions)
+    ca = all_ca[all_ca["ex_date"] <= adjusted["date"].max()]  # same basis as the latest close
+    positions = _ledger_positions(trades, all_ca, paid.max())
     later = pd.Series(1.0, index=dividends.index)
     for ev in ca.itertuples(index=False):  # handful of events
-        later[(dividends["ticker"] == ev.ticker) & (paid < ev.ex_date)] *= ev.ratio
+        mine = dividends["ticker"] == ev.ticker
+        before = mine & (paid < ev.ex_date)
+        late = mine & (paid >= ev.ex_date) & (qty > 0)
+        if late.any() and ev.ticker in positions.columns:
+            before[late] = _struck_before(positions[ev.ticker], qty[late], paid[late], ev.ex_date)
+        later[before] *= ev.ratio
     return per_share / later / dividends["ticker"].map(last) * 100.0
+
+
+def _ledger_positions(
+    trades: pd.DataFrame | None, corporate_actions: pd.DataFrame, until: pd.Timestamp
+) -> pd.DataFrame:
+    """Whole-ledger share counts per calendar day through ``until`` (empty without trades)."""
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    norm = normalize_trades(trades)
+    days = pd.date_range(norm["date"].min(), max(norm["date"].max(), until), freq="D")
+    return build_positions(norm, corporate_actions, days)[0]
+
+
+def _struck_before(held: pd.Series, qty: pd.Series, paid: pd.Series, ex_date: pd.Timestamp) -> np.ndarray:
+    """Rows whose quantity was held before ``ex_date`` and never from it to the payment.
+
+    Args:
+        held: One ticker's daily share count (calendar index).
+        qty: Each row's quantity, i.e. the position on its record date.
+        paid: Each row's payment date (on or after ``ex_date``).
+        ex_date: The corporate action's ex-date.
+
+    Returns:
+        Boolean array aligned to ``qty``; a quantity seen on both sides is
+        ambiguous and stays False.
+    """
+    day = held.index.to_numpy()[:, None]
+    same = held.to_numpy()[:, None] == qty.to_numpy()[None, :]
+    pay = paid.to_numpy()[None, :]
+    ex = ex_date.to_datetime64()
+    pre = (same & (day >= pay - np.timedelta64(RECORD_LOOKBACK_DAYS, "D")) & (day < ex)).any(axis=0)
+    post = (same & (day >= ex) & (day <= pay)).any(axis=0)
+    return pre & ~post
 
 
 # ── Returns and risk ─────────────────────────────────────────────────────────
@@ -385,15 +464,17 @@ def accrual_index(rates_pct: pd.Series) -> pd.Series:
     """Growth of 1 at a daily rate quoted in % per business day (CDI).
 
     The rate published for business day d accrues overnight to the next
-    business day, so the level is stamped on d + 1 day: ``asof(t)`` is then
-    Π(1 + r_d) over every rate date d < t, and asof(b) / asof(a) is the
-    accrual from a's close to b's close — the BCB "CDI acumulado" convention.
+    business day, so its growth is stamped there: on the next rate date (the
+    latest rate on d + 1 business day). ``asof(t)`` is then Π(1 + r_d) over
+    the overnights completed by t — on a weekend or holiday, the level of the
+    last business close — and asof(b) / asof(a) is the accrual from a's close
+    to b's close, the BCB "CDI acumulado" convention.
     """
     r = rates_pct.dropna().sort_index()
     if r.empty:
         return empty_series()
-    level = (1.0 + r / 100.0).cumprod()
-    level.index = level.index + pd.Timedelta(days=1)
+    paid_on = r.index[1:].append(pd.DatetimeIndex([r.index[-1] + pd.offsets.BDay(1)]))
+    level = pd.Series((1.0 + r / 100.0).cumprod().to_numpy(), index=paid_on)
     start = pd.Series([1.0], index=[r.index[0]])
     return pd.concat([start, level])
 

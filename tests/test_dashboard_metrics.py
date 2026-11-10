@@ -26,11 +26,13 @@ from dashboard_metrics import (
     spread_labels,
     to_brl,
     total_return_index,
+    weighted_ytd,
     ytd_changes,
 )
 
 SPLIT = actions_frame([("AAAA3", S[3], 5.0)])  # 1:5 split
 YEAR = S[2]  # treat S[2] as Jan 1 of the reporting year
+BASE = S[1]  # last B3 session before YEAR: the YTD base
 
 
 def _prices() -> pd.DataFrame:
@@ -57,15 +59,29 @@ def test_adjusted_prices_restate_history_in_todays_share_basis():
 
 
 def test_ytd_is_continuous_across_a_split():
-    ytd = ytd_changes(adjusted_prices(_prices(), SPLIT), YEAR)
+    ytd = ytd_changes(adjusted_prices(_prices(), SPLIT), YEAR, BASE)
     assert ytd["AAAA3"] == pytest.approx(5.0)  # base = last close before the year (100 → 21 × 5)
-    raw = ytd_changes(adjusted_prices(_prices(), None), YEAR)
+    raw = ytd_changes(adjusted_prices(_prices(), None), YEAR, BASE)
     assert raw["AAAA3"] == pytest.approx(-79.0)  # what the dashboard showed before
 
 
 def test_ytd_of_a_ticker_bought_this_year_starts_at_its_first_close():
     p = prices_frame([(S[3], "DDDD3", 8.0), (S[4], "DDDD3", 10.0)])
-    assert ytd_changes(adjusted_prices(p, None), YEAR)["DDDD3"] == pytest.approx(25.0)
+    assert ytd_changes(adjusted_prices(p, None), YEAR, BASE)["DDDD3"] == pytest.approx(25.0)
+
+
+def test_ytd_of_a_rebought_ticker_ignores_its_earlier_holding_period():
+    # prices only hold sessions on which a ticker was held: CCCC3's 2024 close is
+    # from an earlier holding period, not a year-end base.
+    base, now = pd.Timestamp("2025-12-30"), pd.Timestamp("2026-11-06")
+    p = prices_frame(
+        [(base, "AAAA3", 10.0), (now, "AAAA3", 12.0)]  # held over the year end
+        + [(pd.Timestamp("2024-06-03"), "CCCC3", 30.0), (pd.Timestamp("2026-06-01"), "CCCC3", 40.0), (now, "CCCC3", 45.0)]
+    )
+    ytd = ytd_changes(adjusted_prices(p, None), pd.Timestamp("2026-01-01"), base)
+    assert ytd["AAAA3"] == pytest.approx(20.0)
+    assert ytd["CCCC3"] == pytest.approx(12.5)  # from its first 2026 close, not +50 % from 2024
+    assert ytd_changes(adjusted_prices(p, None), pd.Timestamp("2026-01-01"), None)["AAAA3"] == pytest.approx(0.0)
 
 
 def test_holdings_apply_corporate_actions_and_drop_closed_positions():
@@ -84,10 +100,49 @@ def test_segment_scorecard_weights_and_yield():
     fraction = divs.assign(type="FRAÇÕES", total=99.0)  # auctioned fractions: capital, not income
     divs = pd.concat([divs.assign(type="DIVIDENDOS"), fraction], ignore_index=True)
     assert income_events(divs)["type"].tolist() == ["DIVIDENDOS"]
-    card = segment_scorecard(_trades(), SPLIT, adjusted_prices(_prices(), SPLIT), divs, YEAR).set_index("Portfolio")
+    card = segment_scorecard(
+        _trades(), SPLIT, adjusted_prices(_prices(), SPLIT), divs, YEAR, base_session=BASE
+    ).set_index("Portfolio")
     assert card["Weight %"].sum() == pytest.approx(100.0)
     assert card.at["Growth", "YTD Change"] == pytest.approx(5.0)
     assert card.at["Income", "DY %"] == pytest.approx(11.0 / (50 * 11.0) * 100)
+
+
+def test_weighted_ytd_weights_by_start_of_year_value():
+    ytd = pd.Series({"AAAA3": 100.0, "BBBB4": -50.0, "CCCC3": -100.0})
+    equal_start = pd.DataFrame({"ticker": ["AAAA3", "BBBB4"], "value": [200.0, 50.0]})  # 100 each on Jan 1
+    assert weighted_ytd(equal_start, ytd) == pytest.approx(25.0)  # basket, not the end-weighted +70 %
+    wiped = pd.DataFrame({"ticker": ["AAAA3", "CCCC3"], "value": [200.0, 0.0]})  # no start value at −100 %
+    assert weighted_ytd(wiped, ytd) == pytest.approx(100.0)
+    assert weighted_ytd(pd.DataFrame({"ticker": ["AAAA3"], "value": [np.nan]}), ytd) == 0.0  # unpriced
+    assert weighted_ytd(pd.DataFrame(columns=["ticker", "value"]), ytd) == 0.0
+
+
+def test_segment_ytd_is_the_start_weighted_basket():
+    # Growth holds equal year-start stakes that went +100 % and −50 %.
+    p = prices_frame(
+        [(BASE, "AAAA3", 10.0), (S[3], "AAAA3", 20.0), (BASE, "BBBB4", 10.0), (S[3], "BBBB4", 5.0)]
+    )
+    t = trades_frame([(S[0], "BUY", "AAAA3", 100, 10.0), (S[0], "BUY", "BBBB4", 100, 10.0)]).assign(portfolio="Growth")
+    no_income = pd.DataFrame(columns=["dividend_date", "ticker", "type", "total", "portfolio"])
+    card = segment_scorecard(t, None, adjusted_prices(p, None), no_income, YEAR, base_session=BASE)
+    assert card.set_index("Portfolio").at["Growth", "YTD Change"] == pytest.approx(25.0)
+
+
+def test_dividend_yield_keys_the_split_on_the_record_date():
+    # 100 shares before the 1:5 split (500 after). Row 1 was struck on the 100
+    # pre-split shares but paid after the ex-date; row 2 was struck on the 500.
+    t = trades_frame([(S[0], "BUY", "AAAA3", 100, 100.0)])
+    divs = pd.DataFrame(
+        {"dividend_date": [S[5], S[6]], "ticker": ["AAAA3", "AAAA3"], "dividend": [1.0, 0.2],
+         "total": [100.0, 100.0], "quantity": [100, 500]}
+    )
+    dy = dividend_yields(divs, adjusted_prices(_prices(), SPLIT), SPLIT, t)
+    assert dy.tolist() == pytest.approx([1.0 / 5 / 21.0 * 100, 0.2 / 21.0 * 100])
+    # 100 shares also held after the ex-date (sold down to 100): ambiguous → payment-date basis.
+    sold_down = pd.concat([t, trades_frame([(S[4], "SELL", "AAAA3", 400, 21.0)])], ignore_index=True)
+    dy = dividend_yields(divs.iloc[:1], adjusted_prices(_prices(), SPLIT), SPLIT, sold_down)
+    assert dy.tolist() == pytest.approx([1.0 / 21.0 * 100])
 
 
 def test_dividend_yield_restates_pre_split_amounts():
@@ -183,6 +238,18 @@ def test_cdi_accrues_overnight_to_the_next_business_day():
     assert level.asof(mon) == pytest.approx(1.01**2)  # Friday's rate covers the weekend once
     assert level.asof(tue) == pytest.approx(1.01**3)  # Monday's rate known before it prints Tuesday
     sessions = pd.DatetimeIndex([thu, fri, mon, tue])
+    assert period_returns(level, sessions).tolist() == pytest.approx([0.0, 0.01, 0.01, 0.01])
+
+
+def test_cdi_level_on_a_holiday_excludes_the_next_overnight():
+    dec29, dec30, jan2, jan5 = pd.to_datetime(["2025-12-29", "2025-12-30", "2026-01-02", "2026-01-05"])
+    level = accrual_index(pd.Series(1.0, index=[dec29, dec30, jan2, jan5]))  # 1 % per business day
+    jan1, sat = pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03")
+    assert level.asof(jan1) == pytest.approx(level.asof(dec30))  # Dec 30 → Jan 2 not yet earned
+    assert level.asof(sat) == pytest.approx(level.asof(jan2))  # weekend = Friday's close
+    # YTD through Jan 5 earns Dec 30 → Jan 2 and Jan 2 → Jan 5, like a TWR based on Dec 30's close.
+    assert change_since(level[level.index <= jan5], jan1) == pytest.approx((1.01**2 - 1) * 100)
+    sessions = pd.DatetimeIndex([dec29, dec30, jan2, jan5])  # per-session risk-free unchanged
     assert period_returns(level, sessions).tolist() == pytest.approx([0.0, 0.01, 0.01, 0.01])
 
 

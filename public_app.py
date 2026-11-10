@@ -380,11 +380,13 @@ last_session = sessions.index[-1] if not sessions.empty else latest
 daily_ret_pct = float(sessions.iloc[-1]) * 100.0 if not sessions.empty else 0.0
 rf_per_session = dm.period_returns(cdi_level, sessions.index) if not cdi_level.empty else None
 stats = dm.risk_stats(sessions[sessions.index >= ystart], rf_per_session)
+prior_sessions = sessions.index[sessions.index < ystart]
+base_session = prior_sessions[-1] if len(prior_sessions) else None  # last B3 close before Jan 1
 
 adjusted = dm.adjusted_prices(prices, actions)  # today's share basis
-ytd_by_ticker = dm.ytd_changes(adjusted, ystart)
+ytd_by_ticker = dm.ytd_changes(adjusted, ystart, base_session)
 held = dm.holdings(trades, actions, adjusted, port_f, tick_f)
-scorecard = dm.segment_scorecard(trades, actions, adjusted, dividends, ystart, tick_f)
+scorecard = dm.segment_scorecard(trades, actions, adjusted, dividends, ystart, tick_f, base_session=base_session)
 
 held_ytd = ytd_by_ticker.reindex(held["ticker"]).dropna()
 top_tk, top_tk_pct = (held_ytd.idxmax(), float(held_ytd.max())) if not held_ytd.empty else (None, 0.0)
@@ -538,7 +540,7 @@ with r2c2:
         for col in ("YTD Change", "DY %", "Weight %"):
             disp[col] = disp[col].map(lambda x: f"{x:.1f} %")
         st.dataframe(disp, hide_index=True, width="stretch", height=260)
-        st.caption("YTD Change: value-weighted price change of current holdings · DY: YTD income ÷ segment value")
+        st.caption("YTD Change: current holdings as a Jan 1 basket (Σ value ÷ Σ Jan 1 value − 1) · DY: YTD income ÷ segment value")
     else:
         st.info("No segment data.")
 
@@ -558,7 +560,8 @@ with r2c3:
         base = dm.fold_other(sector_weights(dm.holdings(trades, actions, adjusted)), len(PALETTE))
         color_of = dict(zip(base.index, PALETTE, strict=False)) | {"Other": MUTED}  # ≤ 8 slots; tail neutral
         view = view.groupby(view.index.where(view.index.isin(base.index), "Other")).sum()
-        view = (view / view.sum() * 100.0).sort_values(ascending=False)
+        # 1 dp like the tables: exact weights plus public closes give away share counts.
+        view = (view / view.sum() * 100.0).sort_values(ascending=False).round(1)
         view = pd.concat([view.drop("Other", errors="ignore"), view.reindex(["Other"]).dropna()])  # tail last
         fig_d = go.Figure(
             go.Pie(
@@ -620,8 +623,9 @@ with r3c2:
             if d.empty:
                 st.info("No dividends match filters." if not dividends.empty else "No dividend data.")
             else:
-                # Per-event yield on the latest close, split-restated to today's share basis.
-                dy = dm.dividend_yields(d, adjusted, actions)
+                # Per-event yield on the latest close, split-restated to today's share basis
+                # (whole ledger: a row's quantity dates its record day against the splits).
+                dy = dm.dividend_yields(d, adjusted, actions, trades)
                 disp_d = pd.DataFrame(
                     {
                         "Date": d["dividend_date"].dt.strftime("%Y-%m-%d"),

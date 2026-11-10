@@ -38,7 +38,10 @@ SPLIT = pd.Timestamp("2026-01-15")
 
 
 def _tables() -> dict[str, pd.DataFrame]:
-    """Two segments, a 1:2 split, one JCP and one fraction payment."""
+    """Two segments, a 1:2 split, one JCP and one fraction payment.
+
+    Odd lot sizes, so holding weights are not round numbers (as in real data).
+    """
     r = np.where(DAYS.dayofweek < 5, 0.002 * np.sin(np.arange(len(DAYS))), 0.0)
     perf = pd.DataFrame(
         {"date": DAYS.date, "daily_return": r, "twr": np.cumprod(1 + r) - 1, "is_trading_day": DAYS.dayofweek < 5}
@@ -57,9 +60,9 @@ def _tables() -> dict[str, pd.DataFrame]:
                 "date": [DAYS[0].date()] * 2,
                 "side": ["BUY", "BUY"],
                 "ticker": ["AAAA3", "BBBB34"],
-                "quantity": [100, 10],
+                "quantity": [100, 7],
                 "price": [20.0, 50.0],
-                "total": [2000.0, 500.0],
+                "total": [2000.0, 350.0],
                 "fee": [0.0, 0.0],
                 "portfolio": ["CORE", "GLOBAL"],
             }
@@ -79,6 +82,32 @@ def _tables() -> dict[str, pd.DataFrame]:
         "assets": pd.DataFrame({"ticker": ["AAAA3", "BBBB34"], "sector": ["Energy", None]}),
         "benchmark": pd.DataFrame({"date": SESSIONS.date, "price": 600.0 + np.arange(len(SESSIONS))}),
     }
+
+
+def _basket_tables() -> dict[str, pd.DataFrame]:
+    """CORE holds equal Jan 1 stakes that went +100 % and −50 %; GLOBAL is flat. No splits."""
+    t = _tables()
+    in_year = SESSIONS >= pd.Timestamp("2026-01-01")
+    paths = {"AAAA3": (10.0, 20.0), "CCCC3": (10.0, 5.0), "BBBB34": (50.0, 50.0)}  # (2025, 2026) close
+    t["prices"] = pd.concat(
+        [pd.DataFrame({"date": SESSIONS.date, "ticker": tk, "price": np.where(in_year, p1, p0)}) for tk, (p0, p1) in paths.items()],
+        ignore_index=True,
+    )
+    t["trades"] = pd.DataFrame(
+        {
+            "date": [DAYS[0].date()] * 3,
+            "side": ["BUY"] * 3,
+            "ticker": ["AAAA3", "CCCC3", "BBBB34"],
+            "quantity": [100, 100, 10],
+            "price": [10.0, 10.0, 50.0],
+            "total": [1000.0, 1000.0, 500.0],
+            "fee": [0.0] * 3,
+            "portfolio": ["CORE", "CORE", "GLOBAL"],
+        }
+    )
+    t["corporate_actions"] = t["corporate_actions"].iloc[:0]
+    t["assets"] = pd.DataFrame({"ticker": ["AAAA3", "BBBB34", "CCCC3"], "sector": ["Energy", None, "Retail"]})
+    return t
 
 
 class _Cursor:
@@ -173,15 +202,18 @@ def test_dashboard_renders_with_every_feed(fake_backends: list[_Conn]):
     kpis = _kpis(at)
     assert "SPY TR (BRL)" in kpis and "rf = CDI" in kpis
     card = at.dataframe[0].value.set_index("Portfolio")
-    assert card.index.tolist() == ["CORE", "GLOBAL"] and card.at["CORE", "Weight %"] == "80.0 %"  # 1:2 split applied
+    assert card.index.tolist() == ["CORE", "GLOBAL"] and card.at["CORE", "Weight %"] == "85.1 %"  # 1:2 split applied
     assert at.dataframe[2].value["Type"].tolist() == ["JUROS"]  # fraction cash is not a dividend
 
     charts = [json.loads(el.proto.spec) for el in at.get("plotly_chart")]
     lines = {tr["name"]: _decode(tr["y"]) for tr in charts[0]["data"]}
     assert set(lines) == {"Portfolio", "SPY TR (BRL)", "CDI"}
     assert all(abs(y[0]) < 1e-12 for y in lines.values())  # rebased to 0 at the window start
-    pie = charts[1]["data"][0]
-    assert _decode(pie["values"]).sum() == pytest.approx(100.0)  # weights only, never BRL
+    pie = _decode(charts[1]["data"][0]["values"])
+    # Weights only, never BRL, and at 1 dp like the tables: exact weights plus
+    # public closes reconstruct the share counts (85.1063… / 14.8936… → 200 : 7).
+    assert np.allclose(pie * 10, np.round(pie * 10), rtol=0, atol=1e-9)
+    assert abs(pie.sum() - 100.0) <= 0.05 * len(pie) + 1e-9
 
 
 def test_dashboard_degrades_without_external_feeds(fake_backends: list[_Conn], monkeypatch: pytest.MonkeyPatch):
@@ -206,6 +238,16 @@ def test_segment_filter_rerenders(fake_backends: list[_Conn]):
     at.multiselect[0].select("📁 CORE").run()
     assert not at.exception, [e.message for e in at.exception]
     assert at.dataframe[1].value["Ticker"].tolist() == ["AAAA3"]  # Top Holdings follows the filter
+
+
+def test_top_portfolio_is_the_start_weighted_basket(fake_backends: list[_Conn], monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(psycopg2, "connect", lambda **kwargs: _Conn(_basket_tables()))
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.message for e in at.exception]
+    # Σ value / Σ Jan 1 value − 1 = 2500 / 2000 − 1; end-value weights would show +70 %.
+    assert at.dataframe[0].value.set_index("Portfolio").at["CORE", "YTD Change"] == "25.0 %"
+    top = re.search(r"Top Portfolio:\s*CORE\s.*?([+-]\d+\.\d)%", _kpis(at), re.S)
+    assert top is not None and top.group(1) == "+25.0"
 
 
 def test_database_outage_shows_a_message_not_a_traceback(fake_backends: list[_Conn], monkeypatch: pytest.MonkeyPatch):
