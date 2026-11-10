@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] — 2026-11-10
+### Why
+A four-part review of the Nov 3 rebuild (c794ee3..ecd6c08) found defects the test suite could not see:
+- a privacy leak on the public page;
+- two ways to apply a corporate action wrongly;
+- warnings that never reached Telegram;
+- a trade import that checked each line but never the nota as a whole;
+- a segment YTD weighted toward winners.
+
+### Fixed
+- **Privacy** (`public_app.py`): the sector donut sent full-precision weights to the browser, and the donut follows the ticker filter. With two tickers in different sectors, the exact weights plus public closes give away the share counts. Weights now leave the server rounded to 0.1 %, like every table.
+- **Corporate actions applied twice** (`prices_pipeline.sync_corporate_actions`, `backfill_history.plan_corporate_actions`):
+  - The sync matched a Yahoo event to stored rows on the exact ex-date only, so an event Yahoo dated on a different day than the stored row was inserted again. That covers a hand-corrected date, and Yahoo dating on the data-com, the ex-date or the credit day.
+  - Any row for the ticker within 10 days (`CA_MATCH_DAYS`) now counts as the same event, whatever its ratio. Within one run, Yahoo events that close collapse into one.
+  - In the backfill, the hand-verified manual row wins.
+- **Repeating ratios** (`portfolio_engine.entitled_shares`): `ratio` is NUMERIC(18,10), so 1/3 is stored as 0.3333333333 and 300 shares became 99. A product within that storage rounding of a whole number now counts as whole, in both `build_positions` and `average_cost_ledger`.
+- **Silent warnings** (`calculate_daily_twr.build_alerts`):
+  - Only warnings dated after the stored end raised an alert, so anything a back-dated import revealed never reached Telegram; 14 warnings were open.
+  - Every warning on a day the run wrote now raises an alert, and a retry stays quiet.
+  - The two income warnings now carry a date.
+- **Trade import** (`gmail_automation.py`):
+  - Each nota now reconciles to the cent with its own printed *Compras / Vendas à vista* before any database read, so a missed line fails the nota instead of loading part of it.
+  - A Bovespa nota with no recognised line fails instead of passing as NO_TRADES.
+  - A PDF that spans two trading days fails.
+  - Quantity, price and value are read from the right, so an observation code is never taken for the quantity.
+  - A cost cap (1 % of volume + R$ 10) catches a misread D/C flag.
+- **Segment YTD** (`dashboard_metrics.weighted_ytd`): returns were weighted by end value, so equal stakes at +100 % and −50 % read +70 %. YTD is now the basket's return, Σ value ÷ Σ Jan 1 value − 1, which gives +25 %.
+- **Dashboard (lower severity)**:
+  - Per-ticker YTD starts at the last B3 session before Jan 1. A re-bought ticker had started from a close in its earlier holding period.
+  - Dividend yields key a split on the record date, inferred from the row's quantity.
+  - CDI growth is credited on the next rate date, so a holiday's level no longer includes the next overnight.
+- **Daily prices (lower severity)**:
+  - Network time is bounded: 120 s per B3 file; B3 counts as down after 3 consecutive failures or 600 s; the whole fetch phase gets 1,200 s. Whatever was fetched is still written.
+  - B3 files download newest-first, as the docstring always said.
+  - A fallback close that B3 later shows as untraded becomes a no-trade marker.
+- **Alerts** (`alerts.fit`): a long message is cut on a line boundary with every tag closed. A message Telegram rejects (400) is sent once more as plain text.
+- **Imports (lower severity)**:
+  - Ticker answers are validated, and Ctrl-D stops the import instead of saving a placeholder. This applies to both imports.
+  - Assets and trades are written in one transaction with CSV COPY, which fixes an industry name with a comma splitting into an extra column.
+  - In the income import, a blank row mid-sheet no longer drops the lines after it, and "1.500" now parses as 1,500 shares.
+  - Income with no date fails.
+  - Credits dated after today are skipped as provisioned.
+  - Amounts are rounded half-up to the cent before the duplicate check.
+- A ratio-1 (rejected) corporate action no longer hides the fractions warning.
+
+### Added
+- Telegram: "🕒 B3 file for *date* unavailable", "⚠️ Corporate-action check skipped", and a count of open warnings by code in the digest.
+- `--all-warnings`, or `gh workflow run daily_pipeline.yml -f all_warnings=true`, lists every open warning.
+- `pipelines/prompts.py`: one prompt loop for both monthly imports.
+- Tests for every fix, each mutation-checked: it fails when its fix is reverted.
+
+### Not changed
+- CDI and SPY YTD keep their own year-end base, the calendar-period convention. B3 does not trade on Dec 31, so its Dec 31 value is the Dec 30 close.
+- Duplicate check across notas: a deterministic `trade_id` ("<Nr. nota>-<line>") would let the database reject a re-inserted line without a migration. It is not needed while Rico issues one nota per trading day.
+
+### Lessons
+- An alert keyed to "after the last run" misses everything a back-dated import reveals. Key it to what the run wrote.
+- A per-line check cannot see a missing line. Reconcile against the document's own totals.
+- The database rounds too. NUMERIC(18,10) ratios and NUMERIC(10,2) amounts must be modelled wherever they are compared.
+- Anything the browser receives is public, even when it is never displayed.
+
 ## [0.5.1] — 2026-11-10
 ### Why
 The daily Telegram messages stopped after 0.4.0. Before it, the TWR job sent "🔴 Cumulative TWR is negative" on almost every run from Aug 4 to Nov 1, because the pre-0.4.0 series sat between −6 % and +3 %. The corrected series is about +30 %. 0.4.0 rightly removed that alarm as spam, but it was also the only message on a healthy day. A working pipeline and a broken channel then looked the same: silence. A run that died before a script could alert (the test gate, setup, a crash, a DB outage) never reached Telegram either.
